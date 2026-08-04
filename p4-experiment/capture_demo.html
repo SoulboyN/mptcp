@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P4 双节点通信 · ICMP 抓包可视化</title>
+<style>
+  :root {
+    --blue: #3b82f6;
+    --green: #22c55e;
+    --red: #ef4444;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --sw: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    line-height: 1.5;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px;
+    margin-bottom: 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  .panel h3 { margin: 0 0 12px; font-size: 15px; }
+
+  /* ---- topology animation ---- */
+  .topo { position: relative; height: 170px; margin: 6px 0 10px; }
+  .lane {
+    position: absolute; left: 70px; right: 70px; top: 96px; height: 0;
+    border-top: 2px solid #d1d5db;
+  }
+  .node {
+    position: absolute; top: 62px;
+    transform: translateX(-50%);
+    width: 96px; height: 66px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    border-radius: 10px; font-size: 12px; text-align: center;
+    z-index: 3;
+  }
+  .node .name { font-weight: 600; font-size: 13px; }
+  .node .ip { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  #n-h1 { left: 70px; background: #eff6ff; border: 2px solid var(--blue); }
+  #n-h2 { right: 70px; left: auto; transform: translateX(50%); background: #f0fdf4; border: 2px solid var(--green); }
+  #n-sw { left: 50%; background: #fffbeb; border: 2px solid var(--sw); }
+  .port {
+    position: absolute; top: 88px; font-size: 10px; color: var(--muted);
+    transform: translateX(-50%); z-index: 2;
+  }
+  #p1 { left: 290px; } #p2 { right: 290px; }
+  .dot {
+    position: absolute; top: 88px; width: 14px; height: 14px;
+    border-radius: 50%; transform: translate(-50%, -50%);
+    z-index: 5; box-shadow: 0 0 6px rgba(0,0,0,.25);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 8px; font-weight: 700; color: #fff;
+  }
+  .dot .seqlab { position: absolute; top: -14px; font-size: 9px; color: var(--muted); white-space: nowrap; }
+  .dropflash {
+    position: absolute; left: 50%; top: 78px; transform: translateX(-50%);
+    font-size: 12px; font-weight: 700; color: var(--red);
+    background: #fef2f2; border: 1px solid var(--red); border-radius: 6px;
+    padding: 1px 8px; z-index: 6; display: none;
+  }
+  .swflash {
+    position: absolute; left: 50%; top: 40px; transform: translateX(-50%);
+    font-size: 11px; font-weight: 600; color: var(--sw);
+    background: #fffbeb; border: 1px solid var(--sw); border-radius: 6px;
+    padding: 1px 8px; z-index: 6; display: none;
+  }
+  .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  button {
+    border: none; border-radius: 8px; padding: 8px 18px; font-size: 13px;
+    cursor: pointer; font-weight: 600;
+  }
+  #btnPlay { background: var(--blue); color: #fff; }
+  #btnReset { background: #e5e7eb; color: var(--ink); }
+  .speed { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  input[type=range] { width: 110px; }
+  .tbar {
+    flex: 1; min-width: 120px; height: 6px; background: #e5e7eb; border-radius: 3px;
+    position: relative; overflow: hidden;
+  }
+  .tfill { height: 100%; background: var(--blue); width: 0%; }
+
+  /* ---- stats ---- */
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .stat {
+    flex: 1; min-width: 140px; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; background: var(--bg);
+  }
+  .stat .v { font-size: 20px; font-weight: 700; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .ok { color: var(--green); } .bad { color: var(--red); } .blue { color: var(--blue); }
+
+  /* ---- table ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; background: #f9fafb; }
+  tr.dropped { background: #fef2f2; }
+  .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600;
+  }
+  .tag.req { background: #dbeafe; color: #1d4ed8; }
+  .tag.rep { background: #dcfce7; color: #15803d; }
+  .tag.drop { background: #fee2e2; color: #b91c1c; }
+  .dotre { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .legend span { margin-right: 14px; }
+  details { margin-top: 10px; }
+  details summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  pre {
+    background: #0f172a; color: #a5f3fc; padding: 12px; border-radius: 8px;
+    font-size: 11px; overflow-x: auto; line-height: 1.6;
+  }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .hl { font-weight: 600; }
+  .arrow { color: #9ca3af; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>P4 双节点通信 · ICMP 抓包可视化</h1>
+  <div class="sub">数据来源:真实运行 <code>run_dual_node.py</code> 抓取的 <code>ping_capture.pcap</code>。蓝=ICMP 请求,绿=ICMP 应答,红=被交换机丢弃的包。</div>
+
+  <div class="panel">
+    <h3>数据包穿越交换机(动画)</h3>
+    <div class="topo" id="topo">
+      <div class="lane"></div>
+      <div class="node" id="n-h1"><div class="name">h1</div><div class="ip">10.0.0.1</div></div>
+      <div class="node" id="n-sw"><div class="name">BMv2 交换机</div><div class="ip">P4 转发</div></div>
+      <div class="node" id="n-h2"><div class="name">h2</div><div class="ip">10.0.0.2</div></div>
+      <div class="port" id="p1">端口1</div>
+      <div class="port" id="p2">端口2</div>
+      <div class="swflash" id="swFlash">转发 ✔</div>
+      <div class="dropflash" id="dropFlash">丢弃 ✘</div>
+    </div>
+    <div class="controls">
+      <button id="btnPlay">⏸ 暂停</button>
+      <button id="btnReset">↺ 重置</button>
+      <div class="speed">速度 <input type="range" id="speed" min="0.5" max="4" step="0.5" value="1"> <span id="speedVal">1x</span></div>
+      <div class="tbar"><div class="tfill" id="tfill"></div></div>
+      <span style="font-size:11px;color:var(--muted)" id="tClock">0.0 s</span>
+    </div>
+    <div class="legend">
+      <span><span class="dotre" style="background:var(--blue)"></span>ICMP 请求 (echo request)</span>
+      <span><span class="dotre" style="background:var(--green)"></span>ICMP 应答 (echo reply)</span>
+      <span><span class="dotre" style="background:var(--red)"></span>被丢弃的包</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>本次实验统计</h3>
+    <div class="stats">
+      <div class="stat"><div class="v ok">0%</div><div class="k">h1 → h2 丢包率(ping id 281)</div></div>
+      <div class="stat"><div class="v bad">33%</div><div class="k">h2 → h1 丢包率(ping id 283)</div></div>
+      <div class="stat"><div class="v blue">11</div><div class="k">抓到的 ICMP 报文</div></div>
+      <div class="stat"><div class="v bad">1</div><div class="k">被交换机丢弃(seq3 请求)</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>报文明细(类似 Wireshark 的列表)</h3>
+    <table id="tbl">
+      <thead>
+        <tr><th>序号</th><th>相对时间</th><th>类型</th><th>方向</th><th>ICMP id</th><th>seq</th><th>交换机入口 TTL</th><th>结果</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="legend">
+      <span>◀ = h1 → h2</span><span>▶ = h2 → h1</span>
+    </div>
+    <div class="note">注:第 10 行(id 283 seq2 应答)的端口2出口抓包因 tcpdump 负载漏采一帧,但 h2 实际收到了该应答(所以计为成功);第 11 行是唯一真实的丢包——请求进入交换机后未被转发出去,这就是 h2→h1 出现 33% 丢包的原因。</div>
+
+    <details>
+      <summary>查看原始 tcpdump 文本输出</summary>
+      <pre>03:29:47.509779 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 1, length 64
+03:29:47.510123 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 1, length 64
+03:29:47.510142 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 1, length 64
+03:29:47.510397 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 1, length 64
+03:29:48.524583 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 2, length 64
+03:29:48.525119 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 2, length 64
+03:29:48.525136 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 2, length 64
+03:29:48.525616 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 2, length 64
+03:29:49.525917 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 3, length 64
+03:29:49.526268 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo request, id 281, seq 3, length 64
+03:29:49.526282 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 3, length 64
+03:29:49.526423 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo reply, id 281, seq 3, length 64
+03:29:49.529803 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 1, length 64
+03:29:49.530093 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 1, length 64
+03:29:49.530110 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo reply, id 283, seq 1, length 64
+03:29:49.530269 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 1, length 64
+03:29:50.540430 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 2, length 64
+03:29:50.540786 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 2, length 64
+03:29:50.540803 IP 10.0.0.1 &gt; 10.0.0.2: ICMP echo reply, id 283, seq 2, length 64
+03:29:51.564438 IP 10.0.0.2 &gt; 10.0.0.1: ICMP echo request, id 283, seq 3, length 64</pre>
+    </details>
+  </div>
+
+  <div class="note" style="margin-top:18px">
+    这个 HTML 是自包含的,可以直接双击打开,无需联网。重新跑实验后,可用
+    <code>mergecap -w ping_capture.pcap /tmp/cap1.pcap /tmp/cap2.pcap</code> 生成新数据再替换。
+  </div>
+</div>
+
+<script>
+// ---- 从真实抓包提取的数据 ----
+// tIn/tOut 是相对抓包起点 (1785814187.509779) 的毫秒数;
+// 位置:包到达/离开交换机两个端口的时间。
+// LR = 从左到右 (h1->h2), RL = 从右到左 (h2->h1)。
+const PACKETS = [
+  {id:281, seq:1, type:'req', dir:'LR', tIn:0.000,   tOut:0.344,  ttlIn:64,  ok:true},
+  {id:281, seq:1, type:'rep', dir:'RL', tIn:0.363,   tOut:0.618,  ttlIn:64,  ok:true},
+  {id:281, seq:2, type:'req', dir:'LR', tIn:1014.804,tOut:1015.340, ttlIn:64, ok:true},
+  {id:281, seq:2, type:'rep', dir:'RL', tIn:1015.357,tOut:1015.837, ttlIn:64, ok:true},
+  {id:281, seq:3, type:'req', dir:'LR', tIn:2016.138,tOut:2016.489, ttlIn:64, ok:true},
+  {id:281, seq:3, type:'rep', dir:'RL', tIn:2016.503,tOut:2016.644, ttlIn:64, ok:true},
+  {id:283, seq:1, type:'req', dir:'RL', tIn:2020.024,tOut:2020.314, ttlIn:64, ok:true},
+  {id:283, seq:1, type:'rep', dir:'LR', tIn:2020.331,tOut:2020.490, ttlIn:64, ok:true},
+  {id:283, seq:2, type:'req', dir:'RL', tIn:2030.651,tOut:2031.007, ttlIn:64, ok:true},
+  {id:283, seq:2, type:'rep', dir:'LR', tIn:2031.024,tOut:2031.40,  ttlIn:64, ok:true}, // 出口帧漏采,实际已到
+  {id:283, seq:3, type:'req', dir:'RL', tIn:2054.659,tOut:null,     ttlIn:64, ok:false}, // ← 被交换机丢弃!
+];
+const X = { h1:70, p1:290, sw:410, p2:530, h2:770 };
+const COLORS = { req:'#3b82f6', rep:'#22c55e' };
+
+// ---- 位置插值(事件式:每包慢放,间隔压缩) ----
+// 每个包分 4 段:出发段 / 入交换机 / 穿交换 / 到达段。
+// 时长由 FOCUS(传输总时长)统一控制,不再按真实毫秒。
+function posOf(p, t) {
+  const left = p.dir === 'LR';
+  const s = left ? X.h1 : X.h2;
+  const ing = left ? X.p1 : X.p2;
+  const eg = left ? X.p2 : X.p1;
+  const e = left ? X.h2 : X.h1;
+  if (t < p.a0) return null;
+  if (p.ok) {
+    if (t <= p.a1) return s + (ing - s) * (t - p.a0) / (p.a1 - p.a0);
+    if (t <= p.a2) return ing + (eg - ing) * (t - p.a1) / (p.a2 - p.a1);
+    if (t <= p.a3) return eg + (e - eg) * (t - p.a2) / (p.a3 - p.a2);
+    return null;
+  } else {
+    if (t <= p.a1) return s + (ing - s) * (t - p.a0) / (p.a1 - p.a0);
+    return ing + 3; // 丢弃,停在交换机入口
+  }
+}
+function inSwitch(p, t) { return p.ok && t >= p.a1 && t <= p.a2; }
+function inDropZone(p, t) { return !p.ok && t >= p.a1 && t < p.a3; }
+
+// ---- 动画(事件式) ----
+const topo = document.getElementById('topo');
+const dots = [];
+PACKETS.forEach((p, i) => {
+  const d = document.createElement('div');
+  d.className = 'dot';
+  d.style.background = COLORS[p.type];
+  d.style.display = 'none';
+  const lab = document.createElement('div');
+  lab.className = 'seqlab';
+  lab.textContent = (p.type==='req'?'请求':'应答') + ' · seq' + p.seq;
+  d.appendChild(lab);
+  topo.appendChild(d);
+  dots.push(d);
+});
+const swFlash = document.getElementById('swFlash');
+const dropFlash = document.getElementById('dropFlash');
+const tfill = document.getElementById('tfill');
+const tClock = document.getElementById('tClock');
+
+// 事件式时间轴:每包 FOCUS 秒(真正传输),包间 PAUSE 秒(压缩等待)
+const FOCUS = 1.5, PAUSE = 0.7;
+let SEQ = [];
+PACKETS.forEach(p => {
+  const a0 = SEQ.length ? SEQ[SEQ.length-1] + PAUSE : 0;
+  const span = FOCUS;
+  p.a0 = a0;
+  p.a1 = a0 + 0.2 * span;   // 主机→入端口
+  p.a2 = a0 + 0.65 * span;  // 穿过交换机
+  p.a3 = a0 + span;         // 出端口→主机
+  SEQ.push(p.a3);
+});
+const T_END = SEQ[SEQ.length-1];
+let now = 0, playing = true, speed = 1, last = null, raf = null;
+
+function reset() { now = 0; swFlash.style.display = 'none'; dropFlash.style.display = 'none'; }
+function tick(ts) {
+  if (last === null) last = ts;
+  const dt = (ts - last) / 1000; last = ts;
+  if (playing) now += dt * speed;
+  if (now >= T_END) { now = 0; }
+
+  const pct = Math.min(100, now / T_END * 100);
+  tfill.style.width = pct + '%';
+  tClock.textContent = now.toFixed(1) + ' s';
+
+  let anyInSw = false, anyDrop = false;
+  PACKETS.forEach((p, i) => {
+    const x = posOf(p, now);
+    if (x === null) { dots[i].style.display = 'none'; return; }
+    dots[i].style.display = 'flex';
+    dots[i].style.left = x + 'px';
+    if (inDropZone(p, now)) anyDrop = true;
+    else if (inSwitch(p, now)) anyInSw = true;
+  });
+  swFlash.style.display = anyInSw ? 'block' : 'none';
+  dropFlash.style.display = anyDrop ? 'block' : 'none';
+  raf = requestAnimationFrame(tick);
+}
+
+// 表
+const tb = document.querySelector('#tbl tbody');
+PACKETS.forEach((p, i) => {
+  const tr = document.createElement('tr');
+  if (!p.ok) tr.className = 'dropped';
+  const dir = p.dir === 'LR' ? '◀ h1 → h2' : '▶ h2 → h1';
+  const typeTag = p.type === 'req'
+    ? '<span class="tag req">请求</span>'
+    : '<span class="tag rep">应答</span>';
+  const res = p.ok
+    ? '<span class="tag rep">✓ 到达</span>'
+    : '<span class="tag drop">✗ 丢弃</span>';
+  tr.innerHTML = '<td>' + (i+1) + '</td><td>' + p.tIn.toFixed(3) + ' ms</td><td>' + typeTag +
+    '</td><td>' + dir + '</td><td>' + p.id + '</td><td>' + p.seq +
+    '</td><td>' + p.ttlIn + '</td><td>' + res + '</td>';
+  tb.appendChild(tr);
+});
+
+const btnPlay = document.getElementById('btnPlay');
+const btnReset = document.getElementById('btnReset');
+const speedEl = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+btnPlay.onclick = () => { playing = !playing; btnPlay.textContent = playing ? '⏸ 暂停' : '▶ 播放'; };
+btnReset.onclick = () => { now = 0; };
+speedEl.oninput = () => { speed = +speedEl.value; speedVal.textContent = speed + 'x'; };
+
+reset();
+raf = requestAnimationFrame(tick);
+</script>
+</body>
+</html>
