@@ -1,5 +1,5 @@
 # build artifacts
-p4-experiment/build/
+build/
 *.pcap
 *.log
 

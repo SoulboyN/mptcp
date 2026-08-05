@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 节点流量控制实验 · 可视化</title>
+<style>
+  :root {
+    --blue: #3b82f6; --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
+    --ink: #1f2937; --muted: #6b7280; --line: #e5e7eb; --bg: #f8fafc;
+    --card: #fff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background: var(--bg); color: var(--ink); line-height: 1.5; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+           padding: 18px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  .panel h3 { margin: 0 0 12px; font-size: 15px; }
+
+  /* ---- 拓扑 ---- */
+  .topo { position: relative; height: 300px; margin: 6px 0; }
+  .sw { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+        width: 130px; height: 84px; background: #fffbeb; border: 2px solid var(--amber);
+        border-radius: 12px; display:flex; flex-direction:column; align-items:center;
+        justify-content:center; z-index: 3; text-align:center; font-size: 12px; }
+  .sw .t { font-weight: 700; font-size: 13px; }
+  .sw .ip { color: var(--muted); font-size: 11px; }
+  .hnode { position: absolute; transform: translate(-50%,-50%); width: 58px; height: 40px;
+           border-radius: 9px; display:flex; flex-direction:column; align-items:center;
+           justify-content:center; font-size: 11px; z-index: 2; text-align:center; }
+  .hnode .n { font-weight: 700; }
+  .hnode .ip { font-size: 9px; color: #fff; opacity: .9; }
+  .hnode.normal { background: var(--blue); border: 2px solid #1d4ed8; }
+  .hnode.limited { background: var(--red); border: 2px solid #b91c1c; }
+  .hnode.unlimited { background: var(--green); border: 2px solid #15803d; }
+  .ring { position: absolute; left: 50%; top: 50%; border-radius: 50%;
+          border: 1px dashed #cbd5e1; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend span { margin-right: 16px; }
+  .dot2 { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; }
+
+  /* ---- 令牌桶 ---- */
+  .bucket-row { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 6px; }
+  .bucket-card { flex: 1; min-width: 260px; border: 1px solid var(--line); border-radius: 10px;
+                 padding: 14px; background: var(--bg); }
+  .bucket-card .bt { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .bucket-box { position: relative; height: 52px; border: 2px solid #94a3b8; border-radius: 6px;
+                background: #f1f5f9; overflow: hidden; }
+  .bucket-fill { position: absolute; bottom: 0; left: 0; width: 100%; transition: height .1s;
+                 background: linear-gradient(#4ade80,#22c55e); }
+  .token { position:absolute; width: 8px; height: 8px; border-radius:50%; background:#15803d; }
+  .bucket-cap { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .packet-flow { margin-top: 10px; font-size: 12px; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+          font-weight: 600; margin-right: 6px; }
+  .chip.green { background: #dcfce7; color: #15803d; }
+  .chip.red { background: #fee2e2; color: #b91c1c; }
+
+  /* ---- 结果对比 ---- */
+  .compare { display: flex; gap: 24px; flex-wrap: wrap; }
+  .comp-card { flex: 1; min-width: 280px; border: 1px solid var(--line); border-radius: 10px;
+               padding: 16px; }
+  .comp-card h4 { margin: 0 0 4px; font-size: 14px; }
+  .comp-card .desc { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .bars { display: flex; align-items: flex-end; gap: 26px; height: 150px; padding-top: 10px; }
+  .bar-col { display: flex; flex-direction: column; align-items: center; width: 70px; }
+  .bar-val { font-size: 12px; font-weight: 700; margin-bottom: 4px; }
+  .bar { width: 44px; border-radius: 5px 5px 0 0; transition: height .8s; }
+  .bar.sent { background: #93c5fd; }
+  .bar.recv-ok { background: #4ade80; }
+  .bar.recv-part { background: #fca5a5; }
+  .bar-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .stat-line { font-size: 13px; margin-top: 10px; }
+  .big { font-size: 20px; font-weight: 700; }
+  .ok { color: var(--green); } .bad { color: var(--red); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; background: #f9fafb; }
+  .meter-flow { position: relative; height: 70px; margin-top: 8px; }
+  .flow-line { position: absolute; left: 0; right: 0; top: 32px; border-top: 2px solid #d1d5db; }
+  .fdot { position: absolute; top: 26px; width: 14px; height: 14px; border-radius: 50%;
+          transform: translate(-50%,-50%); }
+  .f-green { background: var(--green); box-shadow: 0 0 6px rgba(34,197,94,.6); }
+  .f-red { background: var(--red); box-shadow: 0 0 6px rgba(239,68,68,.6); }
+  .f-in { position:absolute; top: 6px; font-size: 11px; color: var(--muted); }
+  .f-out { position:absolute; bottom: 2px; font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>16 节点 · P4 流量控制实验</h1>
+  <div class="sub">真实数据:15.7 Mbps UDP 流下,h2 被 meter 限速到 8 Mbps → 50% 丢包;h16 不限速 → 0% 丢包。</div>
+
+  <!-- 1. 拓扑 -->
+  <div class="panel">
+    <h3>① 实验拓扑:16 台主机 ↔ 1 台 BMv2 可编程交换机</h3>
+    <div class="topo" id="topo">
+      <div class="ring" id="ring" style="width:240px;height:240px"></div>
+      <div class="sw">
+        <div class="t">BMv2 交换机</div>
+        <div class="ip">P4 转发 + meter 限速</div>
+        <div class="ip">端口 1~16</div>
+      </div>
+    </div>
+    <div class="legend">
+      <span><span class="dot2" style="background:#3b82f6"></span>普通主机</span>
+      <span><span class="dot2" style="background:#ef4444"></span>被限速(演示对象)</span>
+      <span><span class="dot2" style="background:#22c55e"></span>不限速对照</span>
+    </div>
+  </div>
+
+  <!-- 2. 流量控制原理 -->
+  <div class="panel">
+    <h3>② 流量控制原理:逐目的令牌桶(meter)</h3>
+    <p style="font-size:13px;color:var(--muted);margin-top:0">
+      每个<strong>目的主机</strong>配一个桶。桶里有"令牌",按 <code>rate</code> 速度补充;
+      每个包需要消耗令牌才能通过。桶是满的 → 绿色(放行);令牌不够 → 丢弃。这就把流量限制在设定速率内。
+    </p>
+    <div class="bucket-row">
+      <div class="bucket-card">
+        <div class="bt">h2 的桶 —— 限速 8 Mbps(rate=1 byte/µs)</div>
+        <div class="bucket-box" id="bucketLimited"><div class="bucket-fill" id="fillLimited" style="height:60%"></div></div>
+        <div class="packet-flow">
+          <span class="chip red">超速包 → 丢弃</span>
+          <span class="chip green">正常包 → 转发</span>
+        </div>
+        <div class="meter-flow">
+          <div class="flow-line"></div>
+          <div class="f-in" style="left:8px">15.7 Mbps 到达</div>
+          <div class="f-out" style="right:8px">≈8 Mbps 转发</div>
+          <div class="fdot f-red" id="limDot" style="left:50%"></div>
+        </div>
+      </div>
+      <div class="bucket-card">
+        <div class="bt">h16 的桶 —— 不限速(rate=10⁹)</div>
+        <div class="bucket-box" id="bucketUnlim"><div class="bucket-fill" id="fillUnlim" style="height:100%"></div></div>
+        <div class="packet-flow">
+          <span class="chip green">全部转发</span>
+        </div>
+        <div class="meter-flow">
+          <div class="flow-line"></div>
+          <div class="f-in" style="left:8px">15.7 Mbps 到达</div>
+          <div class="f-out" style="right:8px">15.7 Mbps 转发</div>
+          <div class="fdot f-green" id="unlimDot" style="left:50%"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. 结果对比 -->
+  <div class="panel">
+    <h3>③ 实验结果对比(15.7 Mbps UDP 流,各 300 包)</h3>
+    <div class="compare">
+      <div class="comp-card">
+        <h4>h2 —— 限速 8 Mbps</h4>
+        <div class="desc">超过速率上限的包被令牌桶丢弃</div>
+        <div class="bars" id="barsL"></div>
+        <div class="stat-line">丢包率:<span class="big bad">50%</span> &nbsp;300 发 → 150 到</div>
+      </div>
+      <div class="comp-card">
+        <h4>h16 —— 不限速</h4>
+        <div class="desc">所有包通过</div>
+        <div class="bars" id="barsU"></div>
+        <div class="stat-line">丢包率:<span class="big ok">0%</span> &nbsp;300 发 → 300 到</div>
+      </div>
+    </div>
+    <div class="legend" style="margin-top:14px">
+      <span><span class="dot2" style="background:#93c5fd"></span>发送 300</span>
+      <span><span class="dot2" style="background:#4ade80"></span>到达(全部)</span>
+      <span><span class="dot2" style="background:#fca5a5"></span>到达(仅 150)</span>
+    </div>
+  </div>
+
+  <!-- 4. 数据表 -->
+  <div class="panel">
+    <h3>④ 实验数据明细</h3>
+    <table>
+      <thead><tr><th>目的地</th><th>桶 rate</th><th>桶 burst</th><th>流量速率</th><th>发送</th><th>到达</th><th>丢弃</th><th>丢包率</th></tr></thead>
+      <tbody>
+        <tr><td>h2 (10.0.0.2)</td><td>8 Mbps</td><td>1500 B</td><td>15.7 Mbps</td><td>300</td><td>150</td><td>150</td><td style="color:#b91c1c;font-weight:700">50%</td></tr>
+        <tr><td>h16 (10.0.0.16)</td><td>不限速</td><td>—</td><td>15.7 Mbps</td><td>300</td><td>300</td><td>0</td><td style="color:#15803d;font-weight:700">0%</td></tr>
+        <tr><td>全 16 节点连通性</td><td colspan="7">120 / 120 双向 ping 全通</td></tr>
+      </tbody>
+    </table>
+    <div class="sub" style="margin:10px 0 0">
+      注:BMv2 meter 的 rate 单位是 bytes/µs;1 byte/µs = 8 Mbps。15.7 Mbps = 300 × 1400B ÷ 0.0008s。
+      令牌桶按"超过设定速率的部分丢弃",所以 h2 收到约等于 8 Mbps 对应的量(150 包),h16 全收。
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- 16 节点环形布局 ----
+(function(){
+  const topo = document.getElementById('topo');
+  const ring = document.getElementById('ring');
+  const R = 130; // 节点到中心距离
+  const cx = 480, cy = 150;
+  const names = [];
+  for (let i = 1; i <= 16; i++) names.push(i);
+  // 根据当前节点位置计算 (在 CSS 里用绝对定位)
+  names.forEach(i => {
+    const d = document.createElement('div');
+    const angle = (i - 1) / 16 * 2 * Math.PI - Math.PI / 2;
+    const x = cx + R * Math.cos(angle);
+    const y = cy + R * Math.sin(angle);
+    d.className = 'hnode ' + (i === 2 ? 'limited' : (i === 16 ? 'unlimited' : 'normal'));
+    d.style.left = x + 'px';
+    d.style.top = y + 'px';
+    d.innerHTML = '<div class="n">h' + i + '</div><div class="ip">10.0.0.' + i + '</div>';
+    topo.appendChild(d);
+  });
+  ring.style.width = ring.style.height = (R * 2 + 40) + 'px';
+  ring.style.marginLeft = (cx - (R + 20)) + 'px';
+  ring.style.marginTop = (cy - (R + 20)) + 'px';
+})();
+
+// ---- 柱状图 ----
+function bars(el, sent, recv, recvColor) {
+  const max = 300;
+  const h = (v) => (v / max * 130) + 'px';
+  el.innerHTML =
+    '<div class="bar-col"><div class="bar-val">' + sent + '</div>' +
+    '<div class="bar sent" style="height:' + h(sent) + '"></div>' +
+    '<div class="bar-label">发送</div></div>' +
+    '<div class="bar-col"><div class="bar-val">' + recv + '</div>' +
+    '<div class="bar ' + recvColor + '" style="height:' + h(recv) + '"></div>' +
+    '<div class="bar-label">到达</div></div>';
+}
+bars(document.getElementById('barsL'), 300, 150, 'recv-part');
+bars(document.getElementById('barsU'), 300, 300, 'recv-ok');
+
+// ---- 令牌桶动画:限速端令牌被耗尽 → 包被丢 ----
+const fillL = document.getElementById('fillLimited');
+const fillU = document.getElementById('fillUnlim');
+const limDot = document.getElementById('limDot');
+const unlimDot = document.getElementById('unlimDot');
+let phase = 0;
+setInterval(() => {
+  // 限速桶:令牌在 0%..60% 间波动(一直不够,持续丢)
+  fillL.style.height = (20 + Math.sin(phase) * 15 + 25) + '%';
+  limDot.style.left = (50 + Math.sin(phase) * 30) + '%';
+  // 不限速桶:始终满
+  fillU.style.height = '100%';
+  unlimDot.style.left = (50 + Math.sin(phase) * 40) + '%';
+  phase += 0.15;
+}, 120);
+</script>
+</body>
+</html>
