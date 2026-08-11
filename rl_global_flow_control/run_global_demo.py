@@ -126,17 +126,16 @@ def paced_sender(ns, dst_ip, port, n, base_sleep, mult):
             shell=True, stdout=dn, stderr=subprocess.STDOUT)
 
 
-def ecn_ratio(port):
-    """Read the ECN-mark counter for an egress port via CLI; ratio to a
-    nominal packet budget. Returns 0..1."""
-    out, _ = run_cli('register_read ecn_marks {}\n'.format(port - 1))
-    # CLI prints "ecn_marks[15]= 1234"; take the last integer on the line.
+def ecn_ratio(port_idx, budget):
+    """Read ECN-mark counter for a 0-based port index; ratio to `budget`
+    (the number of packets actually sent to that port this round)."""
+    out, _ = run_cli('register_read ecn_marks {}\n'.format(port_idx))
     for line in out.splitlines():
         if '=' in line:
             tail = line.split('=')[-1].strip()
             try:
                 val = int(tail)
-                return min(1.0, val / 20000.0)
+                return min(1.0, float(val) / float(budget)) if budget else 0.0
             except ValueError:
                 continue
     return 0.0
@@ -199,9 +198,10 @@ def main():
         lines.append('table_add ipv4_lpm forward {}/32 => {} {}'.format(
             BASE_IP(i), i, mac_of(NS(i), H_INTF(i))))
     out, err = run_cli('\n'.join(lines) + '\n')
-    # set ECN threshold LOW so marking triggers readily under load
-    run_cli('register_write ecn_thresh 0 1\n')
-    print '  ECN threshold = 1 packet (tunable)'
+    # ECN threshold on deq_timedelta (queue wait in clock ticks). Small
+    # value marks packets that waited even briefly under load.
+    run_cli('register_write ecn_thresh 0 10\n')
+    print '  ECN threshold = 10 ticks of queue wait (tunable)'
 
     # === 6. Train RL policy (offline) ===============================
     print '\n=== 6. Train global RL policy (Q-learning, tiny sim) ==='
@@ -229,20 +229,21 @@ def main():
     time.sleep(0.5)
 
     last_cut = time.time() - 10
-    # Phase A: deliberately oversubscribe for 2 rounds so the switch queues
-    # grow, ECN marks fire, and the scheduler has real congestion to react to.
+    # Phase A: deliberately oversubscribe so the switch queues grow and ECN
+    # marks fire. Slightly above a single sender's share, sustained, so BMv2
+    # can still enqueue (rather than dropping at ingress) and qdepth builds.
     print '  -- phase A: oversubscribe to trigger ECN / DCQCN --'
     for rnd in range(2):
         round_senders = []
         for idx, ((s, d), lis) in enumerate(zip(pairs, listeners)):
             round_senders.append(paced_sender(NS(s), BASE_IP(d), 5200 + idx,
-                                              500, 0.0002, 1.0))  # ~55 Mbps each, sustained
-        deadline = time.time() + 12
+                                              2000, 0.0005, 1.0))  # ~22 Mbps each, sustained
+        deadline = time.time() + 15
         for p in round_senders:
             while p.poll() is None and time.time() < deadline:
                 time.sleep(0.05)
         time.sleep(0.3)
-        ratio = ecn_ratio(2)
+        ratio = ecn_ratio(1, 2000)  # port 2 (index 1), budget = oversub sends
         state = sched.congestion_state(ratio)
         if state >= 1:
             last_cut = time.time()
@@ -262,7 +263,7 @@ def main():
             while p.poll() is None and time.time() < deadline:
                 time.sleep(0.05)
         time.sleep(0.3)
-        ratio = ecn_ratio(2)
+        ratio = ecn_ratio(1, 120)   # port 2 (index 1), budget = sched sends
         state = sched.congestion_state(ratio)
         if state >= 1:
             last_cut = time.time()
@@ -282,10 +283,9 @@ def main():
             recv.append(int(out.strip()))
         except Exception:
             recv.append(0)
-    # total rounds = 2 oversub + 4 scheduled = 6; oversub sends 500/pair,
-    # scheduled sends 120/pair
+    # total rounds = 2 oversub (2000/pair) + 4 scheduled (120/pair)
     n_rounds_sched = 4
-    total_sent = len(pairs) * (2 * 500 + n_rounds_sched * 120)
+    total_sent = len(pairs) * (2 * 2000 + n_rounds_sched * 120)
     total_recv = sum(recv)
     print '  sent:', total_sent, ' received:', total_recv
     print '  per-pair received:', recv

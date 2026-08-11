@@ -88,7 +88,8 @@ control ingress(inout headers h, inout meta m, inout standard_metadata_t sm) {
         if (h.udp.isValid()) {
             h.udp.checksum = 0;
         }
-        m.portIdx = (bit<32>)port;
+        // 0-based egress port index so it matches register indices (0..15).
+        m.portIdx = (bit<32>)(port - 1);
     }
 
     table ipv4_lpm {
@@ -114,6 +115,8 @@ control egress(inout headers h, inout meta m, inout standard_metadata_t sm) {
     register<bit<32>>(1) ecn_thresh;
     // Per-egress-port counter of packets we marked CE.
     register<bit<32>>(16) ecn_marks;
+    // Debug: per-egress-port counter of every packet that reaches egress.
+    register<bit<32>>(16) egress_total;
 
     action mark_ce() {
         h.ipv4.diffserv = h.ipv4.diffserv | 3;   // set ECN field to CE (11)
@@ -125,10 +128,17 @@ control egress(inout headers h, inout meta m, inout standard_metadata_t sm) {
     apply {
         if (h.ipv4.isValid() && sm.egress_port != 511) {
             bit<32> thresh = 0;
-            bit<32> qdepth = (bit<32>)sm.enq_qdepth;
+            // BMv2's enq_qdepth is always 0 in the single-threaded switch,
+            // so use deq_timedelta (how long the packet waited in the
+            // queue) instead: if it exceeds the threshold (in clock ticks),
+            // the packet experienced queuing -> mark CE.
+            bit<32> wait = (bit<32>)sm.deq_timedelta;
+            // debug: count every packet reaching egress
+            bit<32> tv = 0;
+            egress_total.read(tv, m.portIdx);
+            egress_total.write(m.portIdx, tv + 1);
             ecn_thresh.read(thresh, 0);
-            // enq_qdepth is the queue depth (in packets) seen at enqueue.
-            if (qdepth > thresh) {
+            if (wait > thresh) {
                 mark_ce();
             }
         }

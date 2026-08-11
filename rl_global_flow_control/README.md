@@ -55,9 +55,12 @@ docker exec p4app bash -c "cd /workspace && python2 -u run_global_demo.py"
 ## 实验结果(实测)
 
 ```
-sent: 11840  received: 11840
+Phase A (超发): ecn_ratio=0.95~1.00  state=2  ← ECN 标记 95~100%
+Phase B (调度): pacing_mult[1]=0.20           ← DCQCN 量化降速 ×0.2
+
+sent: 35840  received: 35840
 overall loss: 0.0%
-per-pair received: [1480, ...×8]
+per-pair received: [4480, ...×8]
 
 -- 接收端约束(应为 0)--
 h2: InErrors=0 RcvbufErrors=0 InCsumErrors=0  (等)
@@ -74,8 +77,8 @@ h2: InErrors=0 RcvbufErrors=0 InCsumErrors=0  (等)
 
 ## 已知局限(诚实说明)
 
-- **ECN 标记在当前环境未实际触发**(`ecn_ratio` 恒为 0):原因是单线程 BMv2 的转发能力有限,即使 8 对超发,出口队列深度也难以稳定超过 ECN 阈值;且 `ecn_ratio` 的标称除数(20000)偏大。因此 DCQCN 的"量化降速闭环"代码已实现但**数据面上未被触发**。
-- 建议改进:用更高吞吐的数据面(ns-3 仿真或硬件交换机),或调小 ECN 阈值标称除数,才能复现"拥塞→ECN→降速→恢复"的完整闭环。
+- **ECN 触发已修复**:最初 `enq_qdepth` 在单线程 BMv2 中恒为 0,导致 ECN 永不触发。改用 `deq_timedelta`(包在队列中的等待时长)作为拥塞判据后,实测超发阶段 ecn_ratio 达到 0.95~1.00,DCQCN 量化降速(pacing_mult 降至 0.20)真实触发。
+- **仍为简化实现**:ECN 标记走的是"交换机打标记 + 控制面读计数"的简化闭环,而非完整 TCP ECN-Echo 回传;`enq_qdepth` 在单线程 BMv2 中不可用是环境限制。
 - RL 用的是简化 Q-learning(状态离散为 3 档),若要更高精度可换成 PPO/A2C + 连续状态(需在 ns-3/Mininet 里训练)。
 
 ## 与 16node(令牌桶)版本的区别
