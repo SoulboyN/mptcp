@@ -21,7 +21,8 @@
                ↓ 下发速率/额度
 ┌───────────── 数据面 ─────────────┐
 │ P4 交换机:16口转发 + egress       │
-│ 队列深度超阈值 → 打 ECN(CE)标记    │
+│ 排队等待(deq_timedelta)超阈值     │
+│   → 打 ECN(CE)标记 + 计数         │
 └─────────────────────────────────┘
 ```
 
@@ -29,7 +30,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `simple_router_global.p4` | P4:16 口 IPv4 LPM 转发 + egress 队列深度超阈值打 ECN 标记 + 每端口标记计数寄存器(无 meter) |
+| `simple_router_global.p4` | P4:16 口 IPv4 LPM 转发 + egress 排队等待(deq_timedelta)超阈值打 ECN 标记 + 每端口标记计数寄存器(无 meter) |
 | `rl_train.py` | 离线 Q-learning:小型流级仿真器训练全局速率策略,导出 `policy.json` |
 | `global_scheduler.py` | 控制面调度器:RL 策略决策 + DCQCN 量化降速 + 缓慢恢复 + pacing 间隔换算 |
 | `credit_flow.py` | 主机侧 credit 流控:接收方授信、发送方额度内发送,防接收缓冲丢包 |
