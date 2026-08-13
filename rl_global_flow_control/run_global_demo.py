@@ -244,8 +244,19 @@ def main():
     run_cli('register_write ecn_thresh 0 10\n')
     print '  ECN threshold = 10 ticks of queue wait (tunable)'
 
-    # === 6. Load or train RL policy (persisted + env fingerprint) =====
-    print '\n=== 6. Load RL policy (train only if env changed) ==='
+    # === 6. Load / train / fine-tune RL policy =======================
+    # Build the random connection graph first so we can derive a
+    # connection fingerprint: when the graph changes but training params
+    # don't, we do an INCREMENTAL fine-tune instead of full retraining.
+    import flow as flowmod
+    flows, pairs = flowmod.build_connection_graph(range(1, NODES + 1),
+                                                  min_dst=1, max_dst=3, seed=7)
+    import hashlib
+    conn_desc = sorted((f.src, f.dst) for f in flows)
+    conn_fp = hashlib.sha1(repr(conn_desc)).hexdigest()[:12]
+    print '  connection graph: %d directional flows (conn fingerprint %s)' % (
+        len(flows), conn_fp)
+    print '\n=== 6. Load / train / fine-tune RL policy ==='
     import rl_train
     from rl_train import env_fingerprint
     fp = env_fingerprint()
@@ -256,34 +267,60 @@ def main():
                 policy_cfg = json.load(f)
         except Exception:
             policy_cfg = None
-    if policy_cfg is not None and policy_cfg.get('env_fingerprint') == fp:
-        print '  policy.json matches environment fingerprint -> reusing saved policy'
-        print '  saved tree policy:', policy_cfg['policy_tree']
-        print '  saved flow policy:', policy_cfg['policy_flow']
-    else:
-        if policy_cfg is None:
-            print '  no saved policy -> training from scratch'
-        else:
-            print '  environment changed (fingerprint %s != %s) -> retraining' % (
-                policy_cfg.get('env_fingerprint', '?'), fp)
+    if policy_cfg is not None and policy_cfg.get('env_fingerprint') == fp \
+            and policy_cfg.get('conn_fingerprint') == conn_fp:
+        print '  fingerprint + connection match -> reusing saved policy (no training)'
+        print '  tree policy:', policy_cfg['policy_tree']
+        print '  flow policy:', policy_cfg['policy_flow']
+    elif policy_cfg is None:
+        print '  no saved policy -> training from scratch'
         subprocess.check_call(['python2', '-u', 'rl_train.py'])
         with open('policy.json') as f:
             policy_cfg = json.load(f)
+        policy_cfg['conn_fingerprint'] = conn_fp
+        with open('policy.json', 'w') as f:
+            json.dump(policy_cfg, f, indent=2)
+    elif policy_cfg.get('env_fingerprint') != fp:
+        print '  training params changed (saved=%s != %s) -> full retrain' % (
+            policy_cfg.get('env_fingerprint', '?'), fp)
+        subprocess.check_call(['python2', '-u', 'rl_train.py'])
+        with open('policy.json') as f:
+            policy_cfg = json.load(f)
+        policy_cfg['conn_fingerprint'] = conn_fp
+        with open('policy.json', 'w') as f:
+            json.dump(policy_cfg, f, indent=2)
+    else:
+        print '  connection graph changed (saved=%s != %s) -> incremental fine-tune' % (
+            policy_cfg.get('conn_fingerprint', '?'), conn_fp)
+        init_Q = (policy_cfg.get('Q_tree'), policy_cfg.get('Q_flow'))
+        if init_Q[0] and init_Q[1]:
+            Q_tree, Q_flow, p_tree, p_flow = rl_train.train(
+                init_Q=init_Q, alpha=0.05, eps=0.1, episodes=50)
+            policy_cfg['policy_tree'] = p_tree
+            policy_cfg['policy_flow'] = p_flow
+            policy_cfg['Q_tree'] = Q_tree
+            policy_cfg['Q_flow'] = Q_flow
+            policy_cfg['conn_fingerprint'] = conn_fp
+            with open('policy.json', 'w') as f:
+                json.dump(policy_cfg, f, indent=2)
+            print '  fine-tuned on new connection graph (base policy preserved)'
+        else:
+            print '  old policy lacks Q tables -> full training'
+            subprocess.check_call(['python2', '-u', 'rl_train.py'])
+            with open('policy.json') as f:
+                policy_cfg = json.load(f)
+            policy_cfg['conn_fingerprint'] = conn_fp
+            with open('policy.json', 'w') as f:
+                json.dump(policy_cfg, f, indent=2)
     print '  active tree policy:', policy_cfg['policy_tree']
     print '  active flow policy:', policy_cfg['policy_flow']
 
     # === 7. Software-side global scheduling demo ====================
     print '\n=== 7. Global scheduling + DCQCN + credit demo ==='
     from global_scheduler import GlobalScheduler
-    import flow as flowmod
-    # Random connection graph: every node sends to 1..3 random destinations.
-    # Directional flows -> bidirectional traffic when A->B and B->A both exist.
-    flows, pairs = flowmod.build_connection_graph(range(1, NODES + 1),
-                                                  min_dst=1, max_dst=3, seed=3)
     sched = GlobalScheduler('policy.json', flows=pairs)
     reset_live()   # clear previous monitor data
 
-    print '  connection graph: %d directional flows' % len(flows)
     n_subflows = sum(len(f.subflows) for f in flows)
     print '  total subflows:', n_subflows
 

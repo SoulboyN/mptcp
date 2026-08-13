@@ -84,18 +84,30 @@ def hi_n_active(action_idx):
 
 # ---------------- hierarchical Q-learning ----------------
 
-def train():
+def train(init_Q=None, alpha=0.3, eps=0.3, episodes=None):
+    """Q-learning with optional warm start.
+
+    init_Q: (Q_tree, Q_flow) to continue from (incremental fine-tuning).
+            If None, train from scratch.
+    alpha/eps: learning/exploration rates. For fine-tuning pass small alpha
+            (e.g. 0.05) so the base policy is preserved and only adapted.
+    episodes: override EPISODES (fewer rounds for fine-tuning).
+    """
     random.seed(7)
 
-    # Q tables
-    Q_tree = [[0.0] * len(ACTIONS_HI) for _ in range(6)]   # 6 hi-states
-    Q_flow = [[0.0] * len(ACTIONS_LO) for _ in range(N_STATES_LO)]
+    # Q tables: warm-start or fresh
+    if init_Q is not None:
+        Q_tree = [row[:] for row in init_Q[0]]
+        Q_flow = [row[:] for row in init_Q[1]]
+    else:
+        Q_tree = [[0.0] * len(ACTIONS_HI) for _ in range(6)]
+        Q_flow = [[0.0] * len(ACTIONS_LO) for _ in range(N_STATES_LO)]
 
-    alpha = 0.3
     gamma = 0.9
-    eps = 0.3
+    if episodes is None:
+        episodes = EPISODES
 
-    for episode in range(EPISODES):
+    for episode in range(episodes):
         rnd = random.Random(episode)
 
         # ---- alternate: train Q_tree while Q_flow is frozen ----
@@ -167,6 +179,8 @@ def main():
             'policy_tree': p_tree,
             'actions_lo': ACTIONS_LO,
             'policy_flow': p_flow,
+            'Q_tree': Q_tree,
+            'Q_flow': Q_flow,
             'env_fingerprint': env_fingerprint(),
             'meta': {
                 'n_flows': N_FLOWS,
