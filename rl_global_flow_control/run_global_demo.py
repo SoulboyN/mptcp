@@ -159,6 +159,21 @@ def max_ecn_ratio(budget, ports=16):
     return best
 
 
+def udp_recv_counts(namespace_list):
+    """Return a dict {ns: InDatagrams} from /proc/net/snmp for diagnostics."""
+    result = {}
+    for ns in namespace_list:
+        try:
+            snmp = subprocess.check_output(
+                'ip netns exec {} cat /proc/net/snmp'.format(ns), shell=True)
+            udp_line = [l for l in snmp.splitlines() if l.startswith('Udp:')]
+            vals = udp_line[-1].split()[1:] if udp_line else []
+            result[ns] = int(vals[0]) if vals else 0
+        except Exception:
+            result[ns] = 0
+    return result
+
+
 def write_live(round_name, rnd, ratio, state, active_n, mult, extra=None):
     """Append one round's metrics to live_stats.json for the monitor page."""
     entry = {'round': round_name, 'idx': rnd,
@@ -296,6 +311,11 @@ def main():
 
     # map each flow to its port (index by position in flows list)
     flow_port = {i: 5200 + i for i in range(len(flows))}
+    recv_ns_list = [NS(f.dst) for f in flows]
+
+    # per-phase received attribution: snapshot kernel UDP counters
+    snap_before = udp_recv_counts(recv_ns_list)
+    phaseA_sent = len(flows) * 2 * 400
 
     last_cut = time.time() - 10
     # Phase A: oversubscribe to trigger ECN. With 31 flows, keep the per-flow
@@ -324,6 +344,12 @@ def main():
         print '  oversub round %d: ecn_ratio=%.2f state=%d active=%d' % (
             rnd, ratio, state, len(active))
 
+    # Phase A loss attribution: what did receivers actually get during oversub
+    snap_afterA = udp_recv_counts(recv_ns_list)
+    gotA = sum(max(0, snap_afterA[ns] - snap_before.get(ns, 0)) for ns in recv_ns_list)
+    print '  [phaseA] sent %d, received %d, loss %.1f%%' % (
+        phaseA_sent, gotA, 100.0 * (phaseA_sent - gotA) / phaseA_sent)
+
     # Phase B: scheduler-controlled pacing over the free connection graph
     print '  -- phase B: hierarchical RL pacing over free comm --'
     for rnd in range(4):
@@ -349,6 +375,13 @@ def main():
         print '  sched round %d: ecn_ratio=%.2f state=%d active=%d mult=%s' % (
             rnd, ratio, state, len(active), '0.0->%.2f' % mults.get('0.0', 1.0))
         time.sleep(0.2)
+
+    # Phase B loss attribution
+    snap_afterB = udp_recv_counts(recv_ns_list)
+    gotB = sum(max(0, snap_afterB[ns] - snap_afterA.get(ns, 0)) for ns in recv_ns_list)
+    phaseB_sent = len(flows) * 4 * 120
+    print '  [phaseB] sent %d, received %d, loss %.1f%%' % (
+        phaseB_sent, gotB, 100.0 * (phaseB_sent - gotB) / phaseB_sent)
 
     # === 8. Loss attribution by location ============================
     print '\n=== 8. Loss attribution & constraint tuning ==='

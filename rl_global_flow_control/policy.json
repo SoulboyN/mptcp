@@ -1,1 +1,38 @@
-{"policy": [1, 0, 0], "actions": [1.2, 1.0, 0.7, 0.4]}
+{
+  "policy_flow": [
+    0, 
+    0, 
+    0
+  ], 
+  "actions_lo": [
+    1.2, 
+    1.0, 
+    0.7, 
+    0.4
+  ], 
+  "policy_tree": [
+    0, 
+    0, 
+    0, 
+    0, 
+    0, 
+    0
+  ], 
+  "actions_hi": [
+    "all", 
+    "half", 
+    "quarter"
+  ], 
+  "env_fingerprint": "2b9e02c1eb58880b", 
+  "meta": {
+    "episodes": 300, 
+    "bottleneck_bw": 100.0, 
+    "stage_bonus": 5.0, 
+    "reward_delay_coef": 0.4, 
+    "reward_loss_coef": 1.5, 
+    "base_rate": 10.0, 
+    "alt_inner": 20, 
+    "n_states_lo": 3, 
+    "n_flows": 8
+  }
+}
