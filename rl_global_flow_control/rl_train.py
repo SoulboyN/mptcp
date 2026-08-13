@@ -37,6 +37,23 @@ import os
 BOTTLENECK_BW = 100.0   # units of bandwidth
 BASE_RATE     = 10.0    # per-flow base rate (so 8 flows oversubscribe)
 
+# Training-environment parameters. These define the "environment" for the
+# RL problem; if any change, the saved policy is stale and must be retrained.
+N_STATES   = 3
+ACTIONS    = [1.2, 1.0, 0.7, 0.4]
+REWARD_DELAY_COEF = 0.4
+REWARD_LOSS_COEF  = 1.5
+EPISODES   = 300
+
+def env_fingerprint():
+    """Hash of all parameters that affect the learned policy. If this
+    changes, a previously saved policy is not valid for the current
+    environment."""
+    import hashlib
+    payload = (N_STATES, tuple(ACTIONS), REWARD_DELAY_COEF, REWARD_LOSS_COEF,
+               EPISODES, BOTTLENECK_BW, BASE_RATE)
+    return hashlib.sha1(repr(payload)).hexdigest()[:16]
+
 def simulate(policy, steps=400, n_flows=8, seed=1):
     """Run the simulator; returns aggregate stats over the last window."""
     rnd = random.Random(seed)
@@ -84,31 +101,31 @@ def simulate(policy, steps=400, n_flows=8, seed=1):
 
 def train():
     random.seed(7)
-    n_states = 3
-    n_actions = 4
+    n_states = N_STATES
+    n_actions = len(ACTIONS)
     Q = [[0.0] * n_actions for _ in range(n_states)]
     alpha = 0.3
     gamma = 0.9
     eps = 0.3
     policy = [2, 1, 3]  # fallback: low->x1.0, mid->x0.7, high->x0.4
 
-    for episode in range(300):
+    for episode in range(EPISODES):
         # random initial policy for exploration is embedded via eps-greedy
         rnd = random.Random(episode)
         for step in range(40):
-            s = rnd.randint(0, 2)
+            s = rnd.randint(0, N_STATES - 1)
             if rnd.random() < eps:
-                a = rnd.randint(0, 3)
+                a = rnd.randint(0, n_actions - 1)
             else:
                 a = max(range(n_actions), key=lambda i: Q[s][i])
             # reward from a one-step sim snapshot with this (s, a)
-            mul = [1.2, 1.0, 0.7, 0.4][a]
+            mul = ACTIONS[a]
             demand = 8 * BASE_RATE * mul
             util = min(demand, BOTTLENECK_BW) / BOTTLENECK_BW
             loss = max(0.0, demand - BOTTLENECK_BW) / max(demand, 1e-9)
             # congested state -> high delay penalty
             delay = 5.0 + (s * 25.0)
-            r = util - 0.4 * (delay / 40.0) - 1.5 * loss
+            r = util - REWARD_DELAY_COEF * (delay / 40.0) - REWARD_LOSS_COEF * loss
             # next state follows congestion after this action
             if s == 0:
                 s_next = 0 if util < 0.6 else (1 if util < 0.9 else 2)
@@ -148,8 +165,21 @@ def main():
 
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'policy.json')
     with open(out, 'w') as f:
-        json.dump({'actions': [1.2, 1.0, 0.7, 0.4], 'policy': policy}, f)
+        json.dump({
+            'actions': ACTIONS,
+            'policy': policy,
+            'env_fingerprint': env_fingerprint(),
+            'meta': {
+                'n_states': N_STATES,
+                'episodes': EPISODES,
+                'reward_delay_coef': REWARD_DELAY_COEF,
+                'reward_loss_coef': REWARD_LOSS_COEF,
+                'bottleneck_bw': BOTTLENECK_BW,
+                'base_rate': BASE_RATE,
+            },
+        }, f, indent=2)
     print 'policy exported to', out
+    print 'env fingerprint:', env_fingerprint()
 
 
 if __name__ == '__main__':

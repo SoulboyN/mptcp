@@ -203,12 +203,31 @@ def main():
     run_cli('register_write ecn_thresh 0 10\n')
     print '  ECN threshold = 10 ticks of queue wait (tunable)'
 
-    # === 6. Train RL policy (offline) ===============================
-    print '\n=== 6. Train global RL policy (Q-learning, tiny sim) ==='
-    subprocess.check_call(['python2', '-u', 'rl_train.py'])
-    with open('policy.json') as f:
-        policy_cfg = json.load(f)
-    print '  learned policy:', policy_cfg['policy'], ' actions:', policy_cfg['actions']
+    # === 6. Load or train RL policy (persisted + env fingerprint) =====
+    print '\n=== 6. Load RL policy (train only if env changed) ==='
+    import rl_train
+    from rl_train import env_fingerprint
+    fp = env_fingerprint()
+    policy_cfg = None
+    if os.path.exists('policy.json'):
+        try:
+            with open('policy.json') as f:
+                policy_cfg = json.load(f)
+        except Exception:
+            policy_cfg = None
+    if policy_cfg is not None and policy_cfg.get('env_fingerprint') == fp:
+        print '  policy.json matches environment fingerprint -> reusing saved policy'
+        print '  saved policy:', policy_cfg['policy'], ' actions:', policy_cfg['actions']
+    else:
+        if policy_cfg is None:
+            print '  no saved policy -> training from scratch'
+        else:
+            print '  environment changed (fingerprint %s != %s) -> retraining' % (
+                policy_cfg.get('env_fingerprint', '?'), fp)
+        subprocess.check_call(['python2', '-u', 'rl_train.py'])
+        with open('policy.json') as f:
+            policy_cfg = json.load(f)
+    print '  active policy:', policy_cfg['policy'], ' actions:', policy_cfg['actions']
 
     # === 7. Software-side global scheduling demo ====================
     print '\n=== 7. Global scheduling + DCQCN + credit demo ==='
