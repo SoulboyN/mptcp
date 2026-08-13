@@ -108,15 +108,22 @@ def flow_listener(ns, port, seconds):
 
 
 def paced_sender(ns, dst_ip, port, n, base_sleep, mult):
-    """Send n UDP packets from a namespace, with a sleep scaled by mult."""
-    body = (
-        'import socket, time\n'
-        's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
-        'p = b"Q" * 1400\n'
-        'for i in range(%d):\n'
-        '    s.sendto(p, ("%s", %d))\n'
-        '    time.sleep(%r)\n'
-    ) % (n, dst_ip, port, base_sleep / max(mult, 0.1))
+    """Send n UDP packets from a namespace, with a sleep scaled by mult.
+    If mult is None, the flow is inactive this round -> send nothing."""
+    if mult is None:
+        body = (
+            'import time\n'
+            'time.sleep(0.2)\n'
+        )
+    else:
+        body = (
+            'import socket, time\n'
+            's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            'p = b"Q" * 1400\n'
+            'for i in range(%d):\n'
+            '    s.sendto(p, ("%s", %d))\n'
+            '    time.sleep(%r)\n'
+        ) % (n, dst_ip, port, base_sleep / max(mult, 0.1))
     p = os.path.join('/tmp', 'flow_send_%d.py' % port)
     with open(p, 'w') as f:
         f.write(body)
@@ -217,7 +224,8 @@ def main():
             policy_cfg = None
     if policy_cfg is not None and policy_cfg.get('env_fingerprint') == fp:
         print '  policy.json matches environment fingerprint -> reusing saved policy'
-        print '  saved policy:', policy_cfg['policy'], ' actions:', policy_cfg['actions']
+        print '  saved tree policy:', policy_cfg['policy_tree']
+        print '  saved flow policy:', policy_cfg['policy_flow']
     else:
         if policy_cfg is None:
             print '  no saved policy -> training from scratch'
@@ -227,7 +235,8 @@ def main():
         subprocess.check_call(['python2', '-u', 'rl_train.py'])
         with open('policy.json') as f:
             policy_cfg = json.load(f)
-    print '  active policy:', policy_cfg['policy'], ' actions:', policy_cfg['actions']
+    print '  active tree policy:', policy_cfg['policy_tree']
+    print '  active flow policy:', policy_cfg['policy_flow']
 
     # === 7. Software-side global scheduling demo ====================
     print '\n=== 7. Global scheduling + DCQCN + credit demo ==='
@@ -266,17 +275,20 @@ def main():
         state = sched.congestion_state(ratio)
         if state >= 1:
             last_cut = time.time()
-        mult = sched.decide(state, last_cut)
-        print '  oversub round %d: ecn_ratio=%.2f state=%d' % (rnd, ratio, state)
+        active, mults = sched.decide(state, last_cut)
+        print '  oversub round %d: ecn_ratio=%.2f state=%d active=%d' % (
+            rnd, ratio, state, len(active))
 
     # Phase B: scheduler-controlled pacing (RL + DCQCN recovery)
-    print '  -- phase B: scheduler-controlled pacing (RL + DCQCN) --'
+    print '  -- phase B: scheduler-controlled pacing (hierarchical RL + DCQCN) --'
     for rnd in range(4):
-        mult = sched.decide(0, last_cut)
+        active, mults = sched.decide(0, last_cut)
         round_senders = []
         for idx, ((s, d), lis) in enumerate(zip(pairs, listeners)):
+            # per-flow multiplier: None if this flow isn't activated this round
+            m = mults.get(s, 1.0) if s in active else None
             round_senders.append(paced_sender(NS(s), BASE_IP(d), 5200 + idx,
-                                              120, 0.0009, mult.get(s, 1.0)))
+                                              120, 0.0009, m))
         deadline = time.time() + 12
         for p in round_senders:
             while p.poll() is None and time.time() < deadline:
@@ -286,9 +298,9 @@ def main():
         state = sched.congestion_state(ratio)
         if state >= 1:
             last_cut = time.time()
-        mult = sched.decide(state, last_cut)
-        print '  sched round %d: ecn_ratio=%.2f state=%d pacing_mult[1]=%.2f' % (
-            rnd, ratio, state, mult.get(1, 1.0))
+        active, mults = sched.decide(state, last_cut)
+        print '  sched round %d: ecn_ratio=%.2f state=%d active=%d pacing_mult[1]=%.2f' % (
+            rnd, ratio, state, len(active), mults.get(1, 1.0))
         time.sleep(0.2)
 
     # === 8. Loss attribution by location ============================
