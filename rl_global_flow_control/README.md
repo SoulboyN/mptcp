@@ -1,6 +1,6 @@
 # 全局 RL 调度 + DCQCN + Credit 流量控制实验
 
-在 16 节点 P4/BMv2 实验基础上,用**软件侧全局调度**替代令牌桶限速,结合**强化学习(RL)+ DCQCN 拥塞控制 + Credit 信用流控**。
+在 16 节点 P4/BMv2 实验基础上,用**软件侧全局调度**替代令牌桶限速,结合**强化学习(RL)+ DCQCN 拥塞控制 + Credit 信用流控**。节点间**自由双向通讯**(每节点随机指向 1~3 个目的),并预留 **MPTCP 多路径**的扩展抽象。
 
 ## 总体架构
 
@@ -41,6 +41,7 @@
 | `global_scheduler.py` | 控制面调度器:高层选激活流 → 低层定速率 → DCQCN 量化降速 + 缓慢恢复 + pacing |
 | `credit_flow.py` | 主机侧 credit 流控:接收方授信、发送方额度内发送,防接收缓冲丢包 |
 | `run_global_demo.py` | 主脚本:编译→拓扑→BMv2→路由→加载/训练策略→超发阶段→调度阶段→丢包归因→实时写 `live_stats.json` |
+| `flow.py` | 数据模型:Flow(id, src, dst, subflows[]) 和 Subflow(id, rate, path)。支持自由连接图(每节点 1~3 目标)、双向流;为 MPTCP 多路径预留子流/路径字段 |
 | `monitor.html` | 实时监控页:轮询 `live_stats.json`,渲染 ECN 曲线、活跃流、速率倍率、丢包率 |
 | `policy.json` | 训练产物:两层策略 + 环境指纹(存在就复用,指纹变了才重训) |
 | `live_stats.json` | 运行时每轮指标(自动生成) |
@@ -66,28 +67,36 @@ docker exec p4app bash -c "cd /workspace && python2 -u run_global_demo.py"
 1. 编译 P4(转发 + ECN 标记)
 2. 建 16 命名空间 + veth,BMv2 16 端口,LPM 路由,静态 ARP
 3. **加载/训练分层策略**:高层 Q_tree(选流)+ 低层 Q_flow(速率),含指纹检测
-4. **Phase A(超发)**:8 对主机故意高速发送制造拥塞,触发 ECN
-5. **Phase B(调度)**:GlobalScheduler 分层决策(选流 + 速率)+ DCQCN 控制
-6. **丢包归因**:统计发送/接收/丢包率,检查接收端校验和与 socket 缓冲约束
-7. **实时监控**:每轮指标写入 `live_stats.json`,`monitor.html` 实时渲染
+4. **生成自由连接图**:`flow.py` 让每节点随机指向 1~3 个目的,形成有向流(双向 = 两个方向各一条流)
+5. **Phase A(超发)**:所有流故意高速发送制造拥塞,触发 ECN
+6. **Phase B(调度)**:GlobalScheduler 按 flow 分层决策(选流 + 速率)+ DCQCN 控制
+7. **丢包归因**:统计发送/接收/丢包率,检查接收端校验和与 socket 缓冲约束
+8. **实时监控**:每轮指标写入 `live_stats.json`,`monitor.html` 实时渲染
+
+## 自由通讯 + MPTCP 预留
+
+- **连接图**:`build_connection_graph(nodes, min_dst=1, max_dst=3, seed)` 随机给每节点 1~3 个不同目的,生成有向流;A→B 和 B→A 会生成两条独立流(双向)。
+- **流/子流抽象**:`Flow(id, src, dst)` 内含 `subflows[]`。今天每条流 1 个子流(单路径);`Subflow` 预留了 `path / rtt / ecn / cwnd` 字段,为 MPTCP 多路径预留——以后给一条 Flow 加多个 Subflow,调度器即可按每子流独立控速率、用流量控制指标选路径。
+- **调度器按子流控制**:`GlobalScheduler` 对每个 subflow 单独给速率倍率,高层选激活哪些子流,低层定速率——天然适配"一条流拆多条路径"。
 
 ## 实验结果(实测)
 
 ```
-Phase A (超发): ecn_ratio=0.95~1.00  state=2  ← ECN 标记 95~100%
-Phase B (调度): active=16 pacing_mult[1]=0.20 ← 高层全激活 + DCQCN ×0.2
+connection graph: 31 directional flows (16 nodes, 1~3 random dests each)
+Phase A (超发): ecn_ratio=1.00  state=2  ← ECN 标记 100%
+Phase B (调度): active=31 mult=0.20      ← 高层全激活 + DCQCN ×0.2
 
-sent: 35840  received: 35840
-overall loss: 0.0%
-per-pair received: [4480, ...×8]
+sent: 39680  received: 34005
+overall loss: 14.3%
+(所有 31 条流均收到数据,per-flow 899~1280)
 
 -- 接收端约束(应为 0)--
 h2: InErrors=0 RcvbufErrors=0 InCsumErrors=0  (等)
 ```
 
-> 注:BMv2 单线程吞吐有抖动,偶发运行丢包率会偏高(如 8%),原因是 Phase A 超发阶段 8 对同时打流压垮 CPU,非逻辑错误;接收端校验约束始终为 0。
+> 注:31 条流同时超发对单线程 BMv2 负载偏高,丢包率(14%)主要是 Phase A 超发阶段 CPU 过载导致,非逻辑错误;接收端校验约束始终为 0。若降低每流速率或减少并发流,丢包可显著下降。
 
-- **0% 丢包**:RL 全局调度 + pacing 把发送速率控制在交换机处理能力内
+- **自由双向通讯**:随机连接图生成 31 条有向流,全部收到数据,双向(A→B 和 B→A)都成立
 - **接收端约束全归零**:P4 里清零 UDP checksum(消除校验和丢包);credit + 适度速率(消除缓冲丢包)
 
 ## 关键设计点

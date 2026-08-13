@@ -150,6 +150,15 @@ def ecn_ratio(port_idx, budget):
     return 0.0
 
 
+def max_ecn_ratio(budget, ports=16):
+    """Max ECN-marking ratio across all egress ports. With a free connection
+    graph the traffic spreads over many ports, so read all of them."""
+    best = 0.0
+    for p in range(ports):
+        best = max(best, ecn_ratio(p, budget))
+    return best
+
+
 def write_live(round_name, rnd, ratio, state, active_n, mult, extra=None):
     """Append one round's metrics to live_stats.json for the monitor page."""
     entry = {'round': round_name, 'idx': rnd,
@@ -264,71 +273,81 @@ def main():
     # === 7. Software-side global scheduling demo ====================
     print '\n=== 7. Global scheduling + DCQCN + credit demo ==='
     from global_scheduler import GlobalScheduler
-    sched = GlobalScheduler('policy.json', flows=range(1, NODES + 1))
+    import flow as flowmod
+    # Random connection graph: every node sends to 1..3 random destinations.
+    # Directional flows -> bidirectional traffic when A->B and B->A both exist.
+    flows, pairs = flowmod.build_connection_graph(range(1, NODES + 1),
+                                                  min_dst=1, max_dst=3, seed=3)
+    sched = GlobalScheduler('policy.json', flows=pairs)
     reset_live()   # clear previous monitor data
 
-    # Pick 8 sender->receiver pairs to create contention (all cross the
-    # switch; in BMv2 the bottleneck is the single CPU, so pacing matters).
-    pairs = [(1, 2), (3, 4), (5, 6), (7, 8),
-             (9, 10), (11, 12), (13, 14), (15, 16)]
+    print '  connection graph: %d directional flows' % len(flows)
+    n_subflows = sum(len(f.subflows) for f in flows)
+    print '  total subflows:', n_subflows
+
+    # one listener + one sender port per (src,dst) flow
     port = 5200
     listeners = []
-    # start listeners first, one distinct port per pair
-    for (s, d) in pairs:
-        listeners.append(flow_listener(NS(d), port, 25))
+    for f in flows:
+        listeners.append(flow_listener(NS(f.dst), port, 40))
         port += 1
-        time.sleep(0.1)
+        time.sleep(0.05)
     time.sleep(0.5)
 
+    # map each flow to its port (index by position in flows list)
+    flow_port = {i: 5200 + i for i in range(len(flows))}
+
     last_cut = time.time() - 10
-    # Phase A: deliberately oversubscribe so the switch queues grow and ECN
-    # marks fire. Slightly above a single sender's share, sustained, so BMv2
-    # can still enqueue (rather than dropping at ingress) and qdepth builds.
+    # Phase A: oversubscribe to trigger ECN. With 31 flows, keep the per-flow
+    # rate modest so total demand stays within the single-threaded BMv2's
+    # range (otherwise CPU-overload loss masks everything).
     print '  -- phase A: oversubscribe to trigger ECN / DCQCN --'
     for rnd in range(2):
         round_senders = []
-        for idx, ((s, d), lis) in enumerate(zip(pairs, listeners)):
-            round_senders.append(paced_sender(NS(s), BASE_IP(d), 5200 + idx,
-                                              2000, 0.0005, 1.0))  # ~22 Mbps each, sustained
-        deadline = time.time() + 15
-        for p in round_senders:
-            while p.poll() is None and time.time() < deadline:
-                time.sleep(0.05)
-        time.sleep(0.3)
-        ratio = ecn_ratio(1, 2000)  # port 2 (index 1), budget = oversub sends
-        state = sched.congestion_state(ratio)
-        if state >= 1:
-            last_cut = time.time()
-        active, mults = sched.decide(state, last_cut)
-        write_live('oversub', rnd, ratio, state, len(active),
-                   mults.get(1, 1.0))
-        print '  oversub round %d: ecn_ratio=%.2f state=%d active=%d' % (
-            rnd, ratio, state, len(active))
-
-    # Phase B: scheduler-controlled pacing (RL + DCQCN recovery)
-    print '  -- phase B: scheduler-controlled pacing (hierarchical RL + DCQCN) --'
-    for rnd in range(4):
-        active, mults = sched.decide(0, last_cut)
-        round_senders = []
-        for idx, ((s, d), lis) in enumerate(zip(pairs, listeners)):
-            # per-flow multiplier: None if this flow isn't activated this round
-            m = mults.get(s, 1.0) if s in active else None
-            round_senders.append(paced_sender(NS(s), BASE_IP(d), 5200 + idx,
-                                              120, 0.0009, m))
+        for i, f in enumerate(flows):
+            round_senders.append(paced_sender(NS(f.src), BASE_IP(f.dst),
+                                              flow_port[i], 400, 0.001, 1.0))
         deadline = time.time() + 12
         for p in round_senders:
             while p.poll() is None and time.time() < deadline:
                 time.sleep(0.05)
         time.sleep(0.3)
-        ratio = ecn_ratio(1, 120)   # port 2 (index 1), budget = sched sends
+        # measure congestion on the egress port with the most traffic: the
+        # receiver of the flow with the most concurrent senders.
+        ratio = max_ecn_ratio(400)
+        state = sched.congestion_state(ratio)
+        if state >= 1:
+            last_cut = time.time()
+        active, mults = sched.decide(state, last_cut)
+        write_live('oversub', rnd, ratio, state, len(active),
+                   mults.get('0.0', 1.0))
+        print '  oversub round %d: ecn_ratio=%.2f state=%d active=%d' % (
+            rnd, ratio, state, len(active))
+
+    # Phase B: scheduler-controlled pacing over the free connection graph
+    print '  -- phase B: hierarchical RL pacing over free comm --'
+    for rnd in range(4):
+        active, mults = sched.decide(0, last_cut)
+        round_senders = []
+        for i, f in enumerate(flows):
+            sid = f.subflows[0].sid
+            m = mults.get(sid, 1.0) if sid in active else None
+            round_senders.append(paced_sender(NS(f.src), BASE_IP(f.dst),
+                                              flow_port[i], 120, 0.0009, m))
+        deadline = time.time() + 12
+        for p in round_senders:
+            while p.poll() is None and time.time() < deadline:
+                time.sleep(0.05)
+        time.sleep(0.3)
+        ratio = max_ecn_ratio(120)
         state = sched.congestion_state(ratio)
         if state >= 1:
             last_cut = time.time()
         active, mults = sched.decide(state, last_cut)
         write_live('sched', rnd, ratio, state, len(active),
-                   mults.get(1, 1.0))
-        print '  sched round %d: ecn_ratio=%.2f state=%d active=%d pacing_mult[1]=%.2f' % (
-            rnd, ratio, state, len(active), mults.get(1, 1.0))
+                   mults.get('0.0', 1.0))
+        print '  sched round %d: ecn_ratio=%.2f state=%d active=%d mult=%s' % (
+            rnd, ratio, state, len(active), '0.0->%.2f' % mults.get('0.0', 1.0))
         time.sleep(0.2)
 
     # === 8. Loss attribution by location ============================
@@ -342,18 +361,20 @@ def main():
             recv.append(int(out.strip()))
         except Exception:
             recv.append(0)
-    # total rounds = 2 oversub (2000/pair) + 4 scheduled (120/pair)
+    # total = phase A (400/flow x2) + phase B (120/flow x4)
     n_rounds_sched = 4
-    total_sent = len(pairs) * (2 * 2000 + n_rounds_sched * 120)
+    total_sent = len(flows) * (2 * 400 + n_rounds_sched * 120)
     total_recv = sum(recv)
+    print '  flows:', len(flows), ' subflows:', n_subflows
     print '  sent:', total_sent, ' received:', total_recv
-    print '  per-pair received:', recv
+    print '  per-flow received:', recv
     print '  overall loss: {:.1f}%'.format(
         100.0 * (total_sent - total_recv) / total_sent if total_sent else 0)
 
     # receiver checksum loss check (this was a real constraint before)
     print '\n  -- checking receiver checksum constraint (was: InCsumErrors) --'
-    for d in [p[1] for p in pairs[:3]]:
+    for f in flows[:3]:
+        d = f.dst
         snmp = subprocess.check_output(
             'ip netns exec {} cat /proc/net/snmp'.format(NS(d)), shell=True)
         udp_line = [l for l in snmp.splitlines() if l.startswith('Udp:')]
