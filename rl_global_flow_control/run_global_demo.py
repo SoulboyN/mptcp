@@ -148,6 +148,27 @@ def ecn_ratio(port_idx, budget):
     return 0.0
 
 
+def write_live(round_name, rnd, ratio, state, active_n, mult, extra=None):
+    """Append one round's metrics to live_stats.json for the monitor page."""
+    entry = {'round': round_name, 'idx': rnd,
+             'ecn_ratio': round(ratio, 3), 'state': state,
+             'active': active_n, 'pacing_mult': round(mult, 3)}
+    if extra:
+        entry.update(extra)
+    try:
+        with open('live_stats.json', 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except IOError:
+        pass
+
+
+def reset_live():
+    try:
+        open('live_stats.json', 'w').close()
+    except IOError:
+        pass
+
+
 def main():
     global sw_proc
     signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
@@ -242,6 +263,7 @@ def main():
     print '\n=== 7. Global scheduling + DCQCN + credit demo ==='
     from global_scheduler import GlobalScheduler
     sched = GlobalScheduler('policy.json', flows=range(1, NODES + 1))
+    reset_live()   # clear previous monitor data
 
     # Pick 8 sender->receiver pairs to create contention (all cross the
     # switch; in BMv2 the bottleneck is the single CPU, so pacing matters).
@@ -276,6 +298,8 @@ def main():
         if state >= 1:
             last_cut = time.time()
         active, mults = sched.decide(state, last_cut)
+        write_live('oversub', rnd, ratio, state, len(active),
+                   mults.get(1, 1.0))
         print '  oversub round %d: ecn_ratio=%.2f state=%d active=%d' % (
             rnd, ratio, state, len(active))
 
@@ -299,6 +323,8 @@ def main():
         if state >= 1:
             last_cut = time.time()
         active, mults = sched.decide(state, last_cut)
+        write_live('sched', rnd, ratio, state, len(active),
+                   mults.get(1, 1.0))
         print '  sched round %d: ecn_ratio=%.2f state=%d active=%d pacing_mult[1]=%.2f' % (
             rnd, ratio, state, len(active), mults.get(1, 1.0))
         time.sleep(0.2)
@@ -340,6 +366,12 @@ def main():
     print '     receiver-checksum drop constraint) and the scheduler keeps'
     print '     sender pacing below switch capacity (removes CPU-overload'
     print '     drops). Residual loss now comes only from controlled pacing.'
+
+    loss_pct = (100.0 * (total_sent - total_recv) / total_sent
+                if total_sent else 0)
+    write_live('done', 0, 0.0, 0, 0, 0.0,
+               {'sent': total_sent, 'received': total_recv,
+                'loss_pct': round(loss_pct, 2)})
 
     print '\n=== Done ==='
     print 'Topology stays up for manual exploration. Ctrl-C to cleanup.'

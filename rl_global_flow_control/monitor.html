@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>分层 RL 全局调度 · 实时监控</title>
+<style>
+  :root {
+    --blue:#3b82f6; --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
+    --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --bg:#f8fafc; --card:#fff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
+  .wrap{max-width:900px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+  .status{display:inline-block;padding:3px 12px;border-radius:12px;font-size:12px;font-weight:600;margin-bottom:14px}
+  .status.live{background:#dcfce7;color:#15803d}
+  .status.wait{background:#fef3c7;color:#b45309}
+  .status.done{background:#dbeafe;color:#1d4ed8}
+  .cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  .card{flex:1;min-width:130px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;text-align:center}
+  .card .v{font-size:24px;font-weight:700}
+  .card .k{font-size:12px;color:var(--muted);margin-top:2px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+  .panel h3{margin:0 0 10px;font-size:14px}
+  .chart{width:100%;height:200px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:600;background:#f9fafb}
+  .legend{font-size:12px;color:var(--muted);margin-top:8px}
+  .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+  .ok{color:var(--green)} .bad{color:var(--red)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>分层 RL 全局调度 · 实时监控</h1>
+  <div class="sub">监控 <code>run_global_demo.py</code> 的运行:ECN 拥塞标记、活跃流数、速率倍率、丢包率</div>
+  <div class="status wait" id="status">等待数据…</div>
+  <div class="cards">
+    <div class="card"><div class="v" id="cEcn">-</div><div class="k">当前 ECN 标记率</div></div>
+    <div class="card"><div class="v" id="cState">-</div><div class="k">拥塞等级 (0/1/2)</div></div>
+    <div class="card"><div class="v" id="cActive">-</div><div class="k">活跃流数</div></div>
+    <div class="card"><div class="v" id="cMult">-</div><div class="k">速率倍率 (流1)</div></div>
+    <div class="card"><div class="v" id="cLoss">-</div><div class="k">最终丢包率</div></div>
+  </div>
+  <div class="panel">
+    <h3>ECN 标记率 &amp; 速率倍率(实时)</h3>
+    <canvas class="chart" id="chart"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--red)"></span>ECN 标记率</span>
+      <span><span class="sw" style="background:var(--blue)"></span>速率倍率(×)</span>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>各轮明细</h3>
+    <table><thead><tr><th>阶段</th><th>轮次</th><th>ECN</th><th>拥塞</th><th>活跃流</th><th>速率倍率</th></tr></thead>
+      <tbody id="tbody"></tbody></table>
+  </div>
+</div>
+
+<script>
+const chart = document.getElementById('chart');
+const ctx = chart.getContext('2d');
+const statusEl = document.getElementById('status');
+let rows = [];   // parsed {round, idx, ecn_ratio, state, active, pacing_mult}
+let done = false;
+let finalLoss = null;
+
+function draw(){
+  const W = chart.width = chart.clientWidth;
+  const H = chart.height = chart.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  if (rows.length < 1) return;
+  const padL=40, padR=14, padT=12, padB=24;
+  const iw = W-padL-padR, ih = H-padT-padB;
+  // axes
+  ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,H-padB); ctx.lineTo(W-padR,H-padB); ctx.stroke();
+  // gridlines for 0..1.2
+  ctx.fillStyle='#9ca3af'; ctx.font='10px sans-serif';
+  for (let v=0; v<=1.2; v+=0.3){
+    const y = H-padB - (v/1.2)*ih;
+    ctx.strokeStyle='#f3f4f6';
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke();
+    ctx.fillText(v.toFixed(1), 4, y+3);
+  }
+  const x = i => padL + (i/(Math.max(rows.length-1,1)))*iw;
+  const y = v => H-padB - (Math.min(v,1.2)/1.2)*ih;
+  // ECN line (red)
+  ctx.strokeStyle='#ef4444'; ctx.lineWidth=2; ctx.beginPath();
+  rows.forEach((r,i)=>{ i?ctx.lineTo(x(i),y(r.ecn_ratio)):ctx.moveTo(x(i),y(r.ecn_ratio)); });
+  ctx.stroke();
+  // pacing mult line (blue)
+  ctx.strokeStyle='#3b82f6'; ctx.lineWidth=2; ctx.beginPath();
+  rows.forEach((r,i)=>{ i?ctx.lineTo(x(i),y(r.pacing_mult)):ctx.moveTo(x(i),y(r.pacing_mult)); });
+  ctx.stroke();
+  // points
+  rows.forEach((r,i)=>{
+    ctx.fillStyle='#ef4444'; ctx.beginPath(); ctx.arc(x(i),y(r.ecn_ratio),3,0,7); ctx.fill();
+    ctx.fillStyle='#3b82f6'; ctx.beginPath(); ctx.arc(x(i),y(r.pacing_mult),3,0,7); ctx.fill();
+  });
+}
+
+function updateTable(){
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = '';
+  rows.slice().reverse().forEach(r=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+r.round+'</td><td>'+r.idx+'</td><td>'+
+      (r.ecn_ratio||0).toFixed(2)+'</td><td>'+r.state+'</td><td>'+
+      r.active+'</td><td>'+(r.pacing_mult||0).toFixed(2)+'</td>';
+    tb.appendChild(tr);
+  });
+}
+
+async function refresh(){
+  try{
+    const res = await fetch('live_stats.json?t='+Date.now());
+    if (!res.ok) throw new Error(res.status);
+    const text = await res.text();
+    const lines = text.trim().split('\n').filter(Boolean);
+    rows = []; done = false; finalLoss = null;
+    lines.forEach(l=>{
+      try{
+        const o = JSON.parse(l);
+        if (o.round === 'done'){ done = true; finalLoss = o.loss_pct; return; }
+        rows.push(o);
+      }catch(e){}
+    });
+    // cards
+    const last = rows.length ? rows[rows.length-1] : null;
+    document.getElementById('cEcn').textContent = last ? (last.ecn_ratio*100).toFixed(0)+'%' : '-';
+    document.getElementById('cState').textContent = last ? last.state : '-';
+    document.getElementById('cActive').textContent = last ? last.active : '-';
+    document.getElementById('cMult').textContent = last ? '×'+(last.pacing_mult||0).toFixed(2) : '-';
+    document.getElementById('cLoss').textContent = finalLoss!==null ? finalLoss+'%' : '-';
+    // status
+    if (done){ statusEl.textContent = '实验已完成'; statusEl.className='status done'; }
+    else if (rows.length){ statusEl.textContent = '运行中 · 已采集 '+rows.length+' 轮'; statusEl.className='status live'; }
+    else { statusEl.textContent = '等待数据…'; statusEl.className='status wait'; }
+    draw();
+    updateTable();
+  }catch(e){
+    statusEl.textContent = '等待服务器/实验…';
+    statusEl.className='status wait';
+  }
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
