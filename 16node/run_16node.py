@@ -48,10 +48,11 @@ def sh_quiet(cmd):
 def cleanup():
     global sw_proc
     print '\n=== Cleanup ==='
-    if sw_proc and sw_proc.poll() is None:
-        sw_proc.terminate()
-        sw_proc.wait()
-        print '  BMv2 stopped'
+    # Kill ALL simple_switch instances: a leftover from a previous run holds
+    # port 9090 + IPC and makes the next switch die at startup.
+    os.system('pkill -9 -f simple_switch 2>/dev/null')
+    time.sleep(0.5)
+    print '  all BMv2 instances stopped'
     for i in range(1, NODES + 1):
         sh('ip netns del {} 2>/dev/null'.format(NS(i)), check_ok=False)
         sh('ip link del {} 2>/dev/null'.format(SW_INTF(i)), check_ok=False)
