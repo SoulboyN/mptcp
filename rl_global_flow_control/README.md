@@ -81,6 +81,8 @@ docker exec p4app bash -c "cd /workspace && python2 -u run_global_demo.py"
 
 ## 实验结果(实测)
 
+### 阶段 3.7a:首次自由通讯(改进前,丢包 14~18%)
+
 ```
 connection graph: 31 directional flows (16 nodes, 1~3 random dests each)
 Phase A (超发): ecn_ratio=1.00  state=2  ← ECN 标记 100%
@@ -88,13 +90,23 @@ Phase B (调度): active=31 mult=0.20      ← 高层全激活 + DCQCN ×0.2
 
 sent: 39680  received: 34005
 overall loss: 14.3%
-(所有 31 条流均收到数据,per-flow 899~1280)
-
--- 接收端约束(应为 0)--
-h2: InErrors=0 RcvbufErrors=0 InCsumErrors=0  (等)
 ```
 
-> 注:31 条流同时超发对单线程 BMv2 负载偏高,丢包率(14%)主要是 Phase A 超发阶段 CPU 过载导致,非逻辑错误;接收端校验约束始终为 0。若降低每流速率或减少并发流,丢包可显著下降。
+**丢包原因(用数据定位)**:接收端 `InCsumErrors/RcvbufErrors` 全为 0(排除接收端丢包);交换机 `ecn_marks ≈ egress_total`(几乎每个包都在排队)→ 单线程 BMv2 处理速率约束被突破。**31 条流在 Phase A 同时全速发送,总输入速率超过交换机处理上限,包在交换机入口被丢弃**——属于"处理速率约束",非逻辑错误。
+
+### 阶段 3.7b:节点约束优化(改进后,丢包 0%)
+
+**改进**:给 Phase A 施加**节点约束**——把每流速率从 `×1.0` 降到 `×0.5`,使 31 条流的总负载落在单线程 BMv2 的处理能力内。这正是 RL 调度器 pacing 的思想:把总速率控制在交换机能力内。
+
+```
+Phase A (超发, mult=0.5): ecn_ratio=1.00  state=2  ← ECN 仍 100% 触发
+Phase B (调度): active=31 mult=0.20               ← DCQCN 量化降速不变
+
+sent: 39680  received: 39680
+overall loss: 0.0%                    ← 丢包从 14~18% 降到 0%
+```
+
+**保留的能力**:ECN 标记(100%)、DCQCN 量化降速(×0.2)、0% 丢包——"拥塞检测 + 调度 + 无丢包"的完整闭环达成。
 
 - **自由双向通讯**:随机连接图生成 31 条有向流,全部收到数据,双向(A→B 和 B→A)都成立
 - **接收端约束全归零**:P4 里清零 UDP checksum(消除校验和丢包);credit + 适度速率(消除缓冲丢包)
@@ -110,7 +122,7 @@ h2: InErrors=0 RcvbufErrors=0 InCsumErrors=0  (等)
 ## 已知局限(诚实说明)
 
 - **ECN 触发已修复**:最初 `enq_qdepth` 在单线程 BMv2 中恒为 0,导致 ECN 永不触发。改用 `deq_timedelta`(包在队列中的等待时长)作为拥塞判据后,实测超发阶段 ecn_ratio 达到 0.95~1.00,DCQCN 量化降速(pacing_mult 降至 0.20)真实触发。
-- **BMv2 单线程抖动**:软件交换机吞吐受 CPU 影响,超发阶段偶发高丢包(如 8%),属性能抖动而非逻辑错误;接收端校验约束始终为 0。
+- **BMv2 单线程抖动**:软件交换机吞吐受 CPU 限制,若负载超过其处理能力会丢包(曾达 14~18%);通过节点约束(Phase A 速率 ×0.5)把负载压进处理能力内后,实测 0% 丢包,接收端校验约束始终为 0。
 - **"BMv2 died" 已修复**:cleanup() 现在 `pkill` 所有残留 simple_switch + 清 IPC,不再因上次残留的交换机占住 9090 端口导致启动失败。
 - **分层策略偏保守**:简化仿真器下学到的策略是全激活 + ×1.2(吞吐奖励占优);要学到更聪明的策略需 ns-3 等更真实环境。
 - **仍为简化实现**:ECN 标记走"交换机打标记 + 控制面读计数"的简化闭环,而非完整 TCP ECN-Echo 回传。
