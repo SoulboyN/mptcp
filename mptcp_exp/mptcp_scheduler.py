@@ -94,3 +94,70 @@ class MptcpScheduler(object):
 
     def pacing_sleep(self, base_sleep, sid):
         return base_sleep / max(self.rate.get(sid, 1.0), 0.1)
+
+
+# ---- RL-driven congestion-window control (paper core innovation) ----
+# Instead of the fixed slow-start/CA growth in tcp_stack, the scheduler
+# (the SDN global controller) picks a cwnd-adjustment ACTION from a coarse
+# global state. This is the "SDN global traffic awareness -> dynamic
+# heterogeneous subflow congestion control" mechanism.
+
+# cwnd actions: multiply the window by this factor
+CWND_ACTIONS = [2.0, 1.0, 0.5, 0.25]
+# policy: state (0=idle,1=busy,2=congested) -> action idx
+CWND_POLICY = [0, 2, 3]
+
+
+class RlCwndController(object):
+    """Per-round controller that sets each subflow's cwnd via its socket."""
+
+    def __init__(self, flows, actions=CWND_ACTIONS, policy=CWND_POLICY,
+                 min_cwnd=4, max_cwnd=256):
+        self.flows = flows
+        self.actions = actions
+        self.policy = policy
+        self.min_cwnd = min_cwnd
+        self.max_cwnd = max_cwnd
+        # subflow string sid -> tcp socket (set by caller)
+        self.sockets = {}
+
+    def congestion_state(self, ecn_ratio, avg_inflight_ratio):
+        """Coarse global state from SDN-wide signals: ECN (shared) + in-flight
+        pressure (per-path). 0=idle 1=busy 2=congested."""
+        if ecn_ratio >= 0.4 or avg_inflight_ratio >= 0.8:
+            return 2
+        if ecn_ratio >= 0.1 or avg_inflight_ratio >= 0.5:
+            return 1
+        return 0
+
+    def cwnd_action_for(self, state):
+        return self.actions[self.policy[state]]
+
+    def apply(self, ecn_ratio, avg_inflight_ratio):
+        """Decide a cwnd multiplier per state, apply to all subflow sockets.
+        Direct subflows use the same multiplier but their cwnd is not cut by
+        ECN (ECN only feeds the global state; per-path in-flight pressure
+        differentiates them). Returns (state, multiplier)."""
+        state = self.congestion_state(ecn_ratio, avg_inflight_ratio)
+        mul = self.cwnd_action_for(state)
+        for f in self.flows:
+            for sf in f.subflows:
+                sock = self.sockets.get(sf.sid)
+                if sock is None:
+                    continue
+                new_cwnd = max(self.min_cwnd,
+                               min(self.max_cwnd, sock.cwnd * mul))
+                sock.ctrl_cwnd = new_cwnd
+        return state, mul
+
+    def avg_inflight_ratio(self):
+        """Fraction of in-flight / cwnd across subflows (0..~1)."""
+        vals = []
+        for f in self.flows:
+            for sf in f.subflows:
+                sock = self.sockets.get(sf.sid)
+                if sock is None:
+                    continue
+                c = sock._effective_cwnd()
+                vals.append(float(sock.in_flight) / max(c, 1))
+        return sum(vals) / max(len(vals), 1) if vals else 0.0
