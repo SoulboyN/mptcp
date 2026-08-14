@@ -1,0 +1,23 @@
+{
+  "actions_cwnd": [
+    2.0, 
+    1.0, 
+    0.5, 
+    0.25
+  ], 
+  "policy_cwnd": [
+    1, 
+    1, 
+    1
+  ], 
+  "policy_path": [
+    0, 
+    0, 
+    0
+  ], 
+  "actions_path": [
+    "sw", 
+    "direct"
+  ], 
+  "env_fingerprint": "bc746e93b5903367"
+}

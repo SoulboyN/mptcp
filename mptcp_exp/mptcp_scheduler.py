@@ -112,12 +112,22 @@ class RlCwndController(object):
     """Per-round controller that sets each subflow's cwnd via its socket."""
 
     def __init__(self, flows, actions=CWND_ACTIONS, policy=CWND_POLICY,
-                 min_cwnd=4, max_cwnd=256):
+                 min_cwnd=4, max_cwnd=256, policy_path=None):
         self.flows = flows
         self.actions = actions
         self.policy = policy
         self.min_cwnd = min_cwnd
         self.max_cwnd = max_cwnd
+        # load learned policy if available (rl_train_mptcp.py output)
+        if policy_path and os.path.exists(policy_path):
+            import json as _json
+            try:
+                with open(policy_path) as f:
+                    cfg = _json.load(f)
+                self.actions = cfg.get('actions_cwnd', actions)
+                self.policy = cfg.get('policy_cwnd', policy)
+            except Exception:
+                pass
         # subflow string sid -> tcp socket (set by caller)
         self.sockets = {}
 
@@ -161,3 +171,81 @@ class RlCwndController(object):
                 c = sock._effective_cwnd()
                 vals.append(float(sock.in_flight) / max(c, 1))
         return sum(vals) / max(len(vals), 1) if vals else 0.0
+
+
+# ---- HIGH-LEVEL RL: per-segment path selection (paper's hierarchical DRL) --
+# The upper-level policy decides which SUBFLOW gets the next DSN segment,
+# i.e. "dynamic heterogeneous subflow path selection" driven by the SDN
+# global view (ECN + per-subflow occupancy). The lower level
+# (RlCwndController) still owns congestion-window control. Together the
+# action space = {path selection, cwnd multipliers}, and the reward
+# balances throughput AND loss rate.
+
+PATH_ACTIONS = ['direct', 'sw']           # choose path type
+# state (0=idle,1=busy,2=congested) -> prefer path
+PATH_POLICY = ['sw', 'sw', 'direct']      # idle/busy -> spread on switch;
+                                          # congested -> fall back to direct
+                                          # (switch ECN congestion avoids
+                                          #  the shared bottleneck)
+
+
+class RlPathSelector(object):
+    """Per-segment path selector: given global congestion, pick a subflow
+    to carry the next DSN segment. Learns/uses a coarse policy; the same
+    structure can be upgraded to a learned Q table."""
+
+    def __init__(self, flows, actions=PATH_ACTIONS, policy=PATH_POLICY,
+                 policy_path=None):
+        self.flows = flows
+        self.actions = actions
+        self.policy = policy
+        if policy_path and os.path.exists(policy_path):
+            import json as _json
+            try:
+                with open(policy_path) as f:
+                    cfg = _json.load(f)
+                # policy_path entries are indices into actions_path
+                pp = cfg.get('policy_path', [])
+                if pp:
+                    self.actions = cfg.get('actions_path', actions)
+                    self.policy = [self.actions[i] for i in pp]
+            except Exception:
+                pass
+        self.sockets = {}                 # sid -> TcpSocket
+        self.ecn_ratio = 0.0
+
+    def congestion_state(self, ecn_ratio, avg_occ):
+        if ecn_ratio >= 0.4 or avg_occ >= 0.8:
+            return 2
+        if ecn_ratio >= 0.1 or avg_occ >= 0.5:
+            return 1
+        return 0
+
+    def preferred_path(self, state):
+        """Path type the policy prefers for this congestion state."""
+        return self.policy[state]      # PATH_POLICY[state] is already the path
+
+    def select_subflow(self, flow, state):
+        """Pick a subflow of `flow` for the next DSN segment. Prefers the
+        policy's path type; among candidates, pick the one with the least
+        in-flight pressure (so traffic spreads)."""
+        prefer = self.preferred_path(state)
+        # candidates of the preferred path type first
+        cand = [sf for sf in flow.subflows if sf.path == prefer]
+        if not cand:
+            cand = flow.subflows
+        # least in-flight ratio wins (load balancing)
+        best = cand[0]
+        best_occ = 1e9
+        for sf in cand:
+            sock = self.sockets.get(sf.sid)
+            occ = 1.0
+            if sock is not None:
+                c = sock._effective_cwnd()
+                occ = float(sock.in_flight) / max(c, 1)
+            if occ < best_occ:
+                best_occ, best = occ, sf
+        return best
+
+    def observe(self, ecn_ratio):
+        self.ecn_ratio = ecn_ratio
