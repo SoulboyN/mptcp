@@ -144,6 +144,28 @@ def build_direct_links(flows, pairs):
     return links
 
 
+def udp_listener(ns, port, seconds):
+    """Run a simple UDP counter in a namespace; prints received count."""
+    body = (
+        'import socket, time\n'
+        's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+        's.bind(("0.0.0.0", %d)); s.settimeout(%d)\n'
+        'c = 0\n'
+        'try:\n'
+        '    while True:\n'
+        '        s.recvfrom(1500); c += 1\n'
+        'except socket.timeout:\n'
+        '    pass\n'
+        'print c\n'
+    ) % (port, seconds + 2)
+    p = os.path.join('/tmp', 'udp_listen_%d.py' % port)
+    with open(p, 'w') as f:
+        f.write(body)
+    return subprocess.Popen(
+        'ip netns exec {} python2 -u {}'.format(ns, p),
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+
 def main():
     signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
     cleanup()
@@ -428,6 +450,101 @@ def main():
 
     # ---- 10. M5-M7: three-domain congestion control demo ----
     demo_3domain()
+
+    # ---- 10b. Real-environment RL fine-tuning ----
+    # Pre-trained policy is fine-tuned on the LIVE 3-switch topology: each
+    # round sends REAL traffic, reads REAL per-switch ECN, measures REAL
+    # received/loss/delay, updates Q with the REAL reward.
+    try:
+        import rl_real_train as rrt
+        from mptcp_scheduler import PATH_COST
+        trainer = rrt.RealEnvTrainer(flows, sw_ports={1: SW_PORT[0],
+                                                      2: SW_PORT[1],
+                                                      3: SW_PORT[2]})
+
+        def _real_traffic(weights, cwnd_mul):
+            """Send a modest burst over the live topology using the given
+            per-subflow weights; return (received, sent, avg_delay_ms)."""
+            n = 15                              # segments per round (slow)
+            total_sent = 0
+            total_recv = 0
+            delays = []
+            # one listener per receiver namespace on the demo flow
+            demo_flow = flows[0]
+            port = 7500
+            listeners = []
+            for f in flows[:4]:
+                listeners.append(udp_listener(NS(f.dst), port, 12))
+                port += 1
+            time.sleep(0.5)
+            import random as _rnd
+            for _ in range(n):
+                for fi, f in enumerate(flows[:4]):
+                    # pick a subflow by weight
+                    sids = [sf.sid for sf in f.subflows]
+                    ws = [weights.get(sf.sid, 0) for sf in f.subflows]
+                    tot = sum(ws) or 1.0
+                    r = _rnd.random() * tot
+                    acc = 0
+                    chosen = f.subflows[0]
+                    for sf, w in zip(f.subflows, ws):
+                        acc += w
+                        if r <= acc:
+                            chosen = sf
+                            break
+                    # send one packet over the chosen path
+                    if chosen.path == 'direct':
+                        dlink = direct_links[chosen.sid]
+                        ipb = dlink[3].split('/')[0]
+                    else:
+                        s_idx = int(chosen.path[2]) - 1
+                        ipb = sw_ip(f.dst, s_idx + 1)
+                    t0 = time.time()
+                    # send one small UDP packet from the source namespace to
+                    # the chosen path's dest address (written to a temp
+                    # script to avoid shell nested-quote problems)
+                    snd_py = ('import socket\n'
+                              's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+                              's.sendto("Q", ("%s", %d))\n' % (ipb, 7500 + fi))
+                    snd_path = os.path.join('/tmp', 'snd_%d.py' % fi)
+                    with open(snd_path, 'w') as _f:
+                        _f.write(snd_py)
+                    sh_quiet('ip netns exec {} python2 {}'.format(
+                        NS(f.src), snd_path))
+                    total_sent += 1
+                    # measure delay of the burst
+                    delays.append((time.time() - t0) * 1000)
+                    time.sleep(0.01)
+            time.sleep(1)
+            for lis in listeners:
+                try:
+                    out = lis.stdout.readline()
+                    total_recv += int(out.strip())
+                except Exception:
+                    pass
+            avg_delay = sum(delays) / max(len(delays), 1)
+            return total_recv, total_sent, avg_delay
+
+        def _read_real_ecn(sw_idx):
+            """Read REAL ecn_marks of switch sw_idx via CLI."""
+            out, _ = run_cli('register_read ecn_marks 0\n',
+                             thrift_port=SW_PORT[sw_idx - 1])
+            for line in out.splitlines():
+                if '=' in line:
+                    try:
+                        return min(1.0, float(line.split('=')[-1].strip()) / 200.0)
+                    except ValueError:
+                        continue
+            return 0.0
+
+        print '\n=== 10b. Real-environment RL fine-tuning ==='
+        trainer.train_loop(rounds=6, sw_ports=[1, 2, 3],
+                           run_traffic=_real_traffic, read_ecn=_read_real_ecn,
+                           save_every=3)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print '  [!] real-env training skipped:', e
 
     print '\n=== Done (topology up) ==='
     print 'Ctrl-C to cleanup.'
