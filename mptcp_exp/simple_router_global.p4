@@ -101,9 +101,24 @@ control ingress(inout headers h, inout meta m, inout standard_metadata_t sm) {
         default_action = drop();
     }
 
+    // Per-egress-port token bucket (bandwidth shaping). Index = 0..15.
+    // Each switch instance is given a DIFFERENT rate via meter_set_rates,
+    // so switch paths have genuinely different bandwidth (heterogeneous
+    // subflows). GREEN -> forward, non-GREEN -> drop (rate limited).
+    meter(16, MeterType.bytes) m_port;
+
     apply {
         if (h.ipv4.isValid()) {
             ipv4_lpm.apply();
+            // shape by egress port AFTER the route is decided
+            // (511 = the drop/cpu port in BMv2; skip those)
+            if (sm.egress_spec != 511) {
+                bit<32> color = 0;
+                m_port.execute_meter<bit<32>>(m.portIdx, color);
+                if (color != 0) {
+                    drop();
+                }
+            }
         }
     }
 }

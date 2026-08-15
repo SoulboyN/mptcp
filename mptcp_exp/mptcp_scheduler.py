@@ -185,6 +185,13 @@ PATH_ACTIONS = ['sw', 'direct']           # choose path type
 PATH_POLICY = ['sw', 'sw', 'direct']      # idle/busy -> spread on switch;
                                           # congested -> fall back to direct
 
+# ---- path cost (per unit traffic) ----
+# Simulate heterogeneous access economics: cellular is expensive, WiFi
+# free, fiber cheap, direct link cheap. RL reward subtracts cost so the
+# policy learns to prefer cheap paths when performance is comparable.
+PATH_COST = {'direct': 0.1, 'sw1': 0.0, 'sw2': 1.0, 'sw3': 0.2}
+COST_WEIGHT = 0.5
+
 
 class RlPathSelector(object):
     """Per-segment path selector over multiple switch ECN domains.
@@ -225,18 +232,20 @@ class RlPathSelector(object):
         return self.policy[state]
 
     def _path_pressure(self, sf):
-        """Combined pressure of a path: its switch's ECN (if switch path)
-        plus its own in-flight occupancy."""
+        """Combined pressure of a path: its switch's ECN (if switch path),
+        its own in-flight occupancy, PLUS its monetary cost. The cost term
+        makes the selector prefer cheap paths when congestion is similar."""
         sock = self.sockets.get(sf.sid)
         occ = 0.0
         if sock is not None:
             c = sock._effective_cwnd()
             occ = float(sock.in_flight) / max(c, 1)
+        cost = COST_WEIGHT * PATH_COST.get(sf.path, 0.0)
         if sf.path.startswith('sw'):
             s_idx = int(sf.path[2]) - 1      # 'sw1'->0
             ecn = self.sw_ecn.get(s_idx + 1, 0.0)
-            return occ + 0.6 * ecn           # switch ECN adds pressure
-        return occ                            # direct has no switch ECN
+            return occ + 0.6 * ecn + cost    # ECN + cost pressure
+        return occ + cost                    # direct has no ECN, only cost
 
     def select_subflow(self, flow, state):
         """Pick the subflow for the next DSN segment: prefer the policy's

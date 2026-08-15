@@ -236,6 +236,51 @@ def main():
         out, err = run_cli('\n'.join(lines) + '\n', thrift_port=SW_PORT[s-1])
         print '  sw%d: %d routes' % (s, NODES)
 
+    # ---- 7b. Heterogeneous switch config ----
+    # Each switch gets a DIFFERENT bandwidth (per-port meter rate) and a
+    # different ECN threshold, so the 3 switch paths are genuinely
+    # heterogeneous (the paper's "dynamic heterogeneous subflow").
+    #   sw1: slow  (WiFi-like, low bw, sensitive ECN)
+    #   sw2: medium(cellular-like, mid bw, medium ECN)
+    #   sw3: fast  (fiber-like, high bw, tolerant ECN)
+    SW_BW_MBPS  = {1: 25, 2: 60, 3: 140}      # per-switch bandwidth (Mbps)
+    SW_ECN_THR  = {1: 5,  2: 20, 3: 60}       # ECN queue-depth threshold
+    print '\n=== 7b. Heterogeneous switch config (bw + ECN) ==='
+    for s in range(1, N_SW + 1):
+        bw = SW_BW_MBPS[s]
+        bytes_us = max(int(bw) * 1000000 / 8 / 1000000, 1)   # Mbps->bytes/us
+        # unlimited-ish bucket for GREEN (rate = bw, big burst)
+        lines = []
+        for port in range(0, NODES):           # meter index 0..15
+            lines.append('meter_set_rates m_port {} {}:{} {}:{}'.format(
+                port, bytes_us, 150000, bytes_us, 150000))
+        out, err = run_cli('\n'.join(lines) + '\n',
+                           thrift_port=SW_PORT[s-1])
+        # ECN threshold
+        run_cli('register_write ecn_thresh 0 {}\n'.format(SW_ECN_THR[s]),
+                thrift_port=SW_PORT[s-1])
+        print '  sw%d: bw=%d Mbps (%.0f bytes/us), ecn_thresh=%d' % (
+            s, bw, bytes_us, SW_ECN_THR[s])
+
+    # ---- 7c. tc link characteristics (WiFi / cellular / fiber) ----
+    # Use Linux tc netem on each switch's host veth to give the paths
+    # genuinely different delay/jitter/loss. This is real kernel-level
+    # shaping, the closest we can get to heterogeneous access links.
+    #   sw1: WiFi  - delay 10ms +-2ms, 1% loss
+    #   sw2: 4G    - delay 30ms +-10ms, 2% loss
+    #   sw3: fiber - delay 2ms, 0.1% loss
+    SW_TC = {1: 'delay 10ms 2ms loss 1%',
+             2: 'delay 30ms 10ms loss 2%',
+             3: 'delay 2ms loss 0.1%'}
+    print '\n=== 7c. tc link characteristics (WiFi/cell/fiber) ==='
+    for i in range(1, NODES + 1):
+        for s in range(1, N_SW + 1):
+            hi = H_SW_INTF(i, s)          # hN-s1 / hN-s2 / hN-s3
+            # apply on the switch-facing side (root qdisc on the host iface)
+            sh_quiet('ip netns exec {} tc qdisc replace dev {} root netem {}'
+                     .format(NS(i), hi, SW_TC[s]))
+    print '  applied tc netem per switch path'
+
     # ---- 8. Sanity: verify a direct subflow path bypasses the switch ----
     print '\n=== 8. Verify direct subflow connectivity ==='
     # pick the first direct link

@@ -72,7 +72,11 @@ def train():
             share = 0.2 if path == 'direct' else 0.8   # direct unshares bottleneck
             # fixed cwnd multiplier (low level frozen)
             util, delay, loss = step_sim(c, share, 1.0)
-            r = util - 0.4 * (delay / 40.0) - 1.5 * loss
+            # reward includes path COST (heterogeneous access economics):
+            # sw2 (cellular) is expensive, sw1 (wifi) free, direct cheap.
+            path_cost = {'direct': 0.1, 'sw1': 0.0, 'sw2': 1.0, 'sw3': 0.2}
+            cost_penalty = 0.5 * path_cost.get(path, 0.0)
+            r = util - 0.4 * (delay / 40.0) - 1.5 * loss - cost_penalty
             s_next = 2 if loss > 0.2 else (1 if share > 0.5 else 0)
             Q_path[c][a] += ALPHA * (r + GAMMA * max(Q_path[s_next]) - Q_path[c][a])
 
