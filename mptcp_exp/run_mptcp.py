@@ -2,17 +2,22 @@
 """
 run_mptcp.py -- MPTCP-style multi-path experiment on 16 nodes.
 
-Topology:
-  - 16 netns hosts on a single BMv2 switch (subnet 10.0.0.0/24) as before.
+Topology (3 switches + direct links):
+  - 16 netns hosts, each with one interface per switch:
+      hN-s1 -> sw1 (10.0.0.0/24)
+      hN-s2 -> sw2 (10.2.0.0/24)
+      hN-s3 -> sw3 (10.3.0.0/24)
+    So a 'sw1'/'sw2'/'sw3' subflow uses that switch's subnet address pair:
+    genuinely different physical path + INDEPENDENT ECN domain per switch.
   - PLUS direct veth links for the 'direct' subflows of each connection:
     node keeps an extra interface hN-dM in a dedicated /30 subnet
-    (10.1.<idx>.0/30), so direct subflows do NOT cross the switch.
+    (10.1.<idx>.0/30), so direct subflows do NOT cross any switch.
 
 Data plane (software-side):
   - senders emit packets tagged with (flow_id, subflow_id, SSN) in the
     UDP payload; receivers reorder by DSN across subflows (M3/M4).
-  - credit flow control per subflow; DCQCN ECN on switch subflows; RL
-    global scheduler (M5-M7) added in later milestones.
+  - credit flow control per subflow; DCQCN ECN per switch; RL global
+    scheduler (M5-M7) added in later milestones.
 
 Usage: docker exec p4app bash -c 'cd /workspace && python2 -u mptcp_exp/run_mptcp.py'
 """
@@ -34,10 +39,18 @@ NODES = 16
 NET = '10.0.0'
 BASE_IP = lambda i: '{}.{}'.format(NET, i)
 NS     = lambda i: 'ns-h{}'.format(i)
-H_INTF = lambda i: 'h{}-eth0'.format(i)      # switch-facing interface
+H_INTF = lambda i: 'h{}-eth0'.format(i)      # switch-facing interface (sw1)
 SW_INTF = lambda i: 's1-eth{}'.format(i)
 
-sw_proc = None
+# ---- 3 switches: each node gets one interface per switch ----
+N_SW = 3
+SW_NAME = ['s1', 's2', 's3']
+SW_PORT = [9090, 9091, 9092]                  # thrift port per switch
+# per-switch host interface: hN-s1, hN-s2, hN-s3 ; switch side: s2-ethN ...
+H_SW_INTF = lambda i, s: 'h{}-{}'.format(i, SW_NAME[s-1])
+SW_SIDE   = lambda i, s: '{}-eth{}'.format(SW_NAME[s-1], i)
+
+sw_procs = {}                                  # switch idx -> Popen
 
 
 def sh(cmd, check_ok=True):
@@ -57,15 +70,15 @@ def sh_quiet(cmd):
 
 
 def cleanup():
-    global sw_proc
     print '\n=== Cleanup ==='
     os.system('pkill -9 -f simple_switch 2>/dev/null')
     time.sleep(0.5)
     print '  all BMv2 stopped'
     for i in range(1, NODES + 1):
         sh('ip netns del {} 2>/dev/null'.format(NS(i)), check_ok=False)
-        sh('ip link del {} 2>/dev/null'.format(SW_INTF(i)), check_ok=False)
-        sh('ip link del {} 2>/dev/null'.format(H_INTF(i)), check_ok=False)
+        for s in range(1, N_SW + 1):
+            sh('ip link del {} 2>/dev/null'.format(SW_SIDE(i, s)), check_ok=False)
+            sh('ip link del {} 2>/dev/null'.format(H_SW_INTF(i, s)), check_ok=False)
     # any leftover direct-link interfaces (hN-dM / hN-dM peer)
     os.system("ip link show 2>/dev/null | grep -oE 'h[0-9]+-d[0-9]+' | sort -u "
               "| while read x; do ip link del $x 2>/dev/null; done")
@@ -79,9 +92,9 @@ def mac_of(ns, iface):
     return out.strip()
 
 
-def run_cli(cmds):
+def run_cli(cmds, thrift_port=9090):
     p = subprocess.Popen(
-        ['simple_switch_CLI', '--thrift-port', '9090'],
+        ['simple_switch_CLI', '--thrift-port', str(thrift_port)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = p.communicate(input=cmds)
     return out, err
@@ -132,7 +145,6 @@ def build_direct_links(flows, pairs):
 
 
 def main():
-    global sw_proc
     signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
     cleanup()
     time.sleep(0.5)
@@ -143,8 +155,8 @@ def main():
     print '=== 1. Build MPTCP connection graph ==='
     flows, pairs = fmod.build_mptcp_graph(range(1, NODES + 1),
                                           min_sub=3, max_sub=4, seed=3)
-    nd, ns = fmod.count_by_path(flows)
-    print '  flows:', len(flows), ' direct subflows:', nd, ' switch subflows:', ns
+    counts = fmod.count_by_path(flows)
+    print '  flows:', len(flows), ' subflow counts:', counts
 
     # ---- 2. Compile P4 ----
     print '\n=== 2. Compile P4 ==='
@@ -155,51 +167,74 @@ def main():
         '--p4runtime-files', P4INFO, '-o', os.path.join(_HERE, 'build'), P4FILE
     ])
 
-    # ---- 3. Build 16-node switch topology ----
-    print '\n=== 3. Build 16-node switch topology ==='
+    # ---- 3. Build 16-node topology across 3 switches ----
+    # Each node gets one interface per switch: hN-s1 (sw1), hN-s2 (sw2),
+    # hN-s3 (sw3). Each switch has its own subnet:
+    #   sw1: 10.0.0.0/24   sw2: 10.2.0.0/24   sw3: 10.3.0.0/24
+    # so a subflow going through sw2 uses the sw2 subnet address pair
+    # (genuinely different path + independent ECN domain per switch).
+    SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    def sw_ip(i, s):            # node i's address on switch s's subnet
+        return '{}.{}'.format(SW_NET[s], i)
+    print '\n=== 3. Build 16-node topology (3 switches) ==='
     for i in range(1, NODES + 1):
-        sh('ip link add {} type veth peer name {}'.format(H_INTF(i), SW_INTF(i)))
-        sh('ip link set {} up'.format(SW_INTF(i)))
         sh('ip netns add {}'.format(NS(i)))
-        sh('ip link set {} netns {}'.format(H_INTF(i), NS(i)))
-        sh('ip netns exec {} ip addr add {}/24 dev {}'.format(NS(i), BASE_IP(i), H_INTF(i)))
-        sh('ip netns exec {} ip link set {} up'.format(NS(i), H_INTF(i)))
+        for s in range(1, N_SW + 1):
+            hi = H_SW_INTF(i, s)          # hN-s1 / hN-s2 / hN-s3
+            ss = SW_SIDE(i, s)            # s1-ethN / s2-ethN / s3-ethN
+            sh('ip link add {} type veth peer name {}'.format(hi, ss))
+            sh('ip link set {} up'.format(ss))
+            sh('ip link set {} netns {}'.format(hi, NS(i)))
+            sh('ip netns exec {} ip addr add {}/24 dev {}'.format(
+                NS(i), sw_ip(i, s), hi))
+            sh('ip netns exec {} ip link set {} up'.format(NS(i), hi))
         sh('ip netns exec {} ip link set lo up'.format(NS(i)))
 
-    # Static ARP on switch subnet (all pairs)
-    print '\n=== 4. Static ARP (switch subnet) ==='
+    # Static ARP on each switch subnet (all pairs, per interface)
+    print '\n=== 4. Static ARP (per switch subnet) ==='
     for i in range(1, NODES + 1):
-        for j in range(1, NODES + 1):
-            if i == j:
-                continue
-            sh_quiet('ip netns exec {} ip neigh replace {} lladdr {} dev {} nud permanent'
-                     .format(NS(i), BASE_IP(j), mac_of(NS(j), H_INTF(j)), H_INTF(i)))
+        for s in range(1, N_SW + 1):
+            hi = H_SW_INTF(i, s)
+            for j in range(1, NODES + 1):
+                if i == j:
+                    continue
+                mj = mac_of(NS(j), H_SW_INTF(j, s))
+                sh_quiet('ip netns exec {} ip neigh replace {} lladdr {} dev {} nud permanent'
+                         .format(NS(i), sw_ip(j, s), mj, hi))
 
     # ---- 5. Direct links for 'direct' subflows ----
     print '\n=== 5. Build direct subflow links ==='
     direct_links = build_direct_links(flows, pairs)
 
-    # ---- 6. Start BMv2 ----
-    print '\n=== 6. Start BMv2 (16 ports) ==='
-    cmd = ['simple_switch', '--thrift-port', '9090']
-    for i in range(1, NODES + 1):
-        cmd += ['-i', '{}@{}'.format(i, SW_INTF(i))]
-    cmd.append(JSON)
-    logf = open(os.path.join(_HERE, 'build', 'bmv2_mptcp.log'), 'w')
-    sw_proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
-    time.sleep(5)
-    if sw_proc.poll() is not None:
-        print '  [!] BMv2 died!'
-        logf.close()
-        sys.exit(1)
+    # ---- 6. Start 3 BMv2 switches (independent ECN domains) ----
+    # Each switch needs a distinct --device-id so its notification IPC
+    # (ipc:///tmp/bmv2-<id>-notifications.ipc) does not collide; without
+    # it switch 2/3 die at startup with "Address already in use".
+    print '\n=== 6. Start 3 BMv2 switches ==='
+    for s in range(1, N_SW + 1):
+        cmd = ['simple_switch', '--thrift-port', str(SW_PORT[s-1]),
+               '--device-id', str(s - 1)]
+        for i in range(1, NODES + 1):
+            cmd += ['-i', '{}@{}'.format(i, SW_SIDE(i, s))]
+        cmd.append(JSON)
+        logf = open(os.path.join(_HERE, 'build', 'bmv2_mptcp_s%d.log' % s), 'w')
+        sw_procs[s] = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+        time.sleep(4)
+        if sw_procs[s].poll() is not None:
+            print '  [!] switch %d died!' % s
+            logf.close()
+            sys.exit(1)
+    print '  switches running on thrift:', SW_PORT
 
-    # LPM routes (switch subnet)
-    print '\n=== 7. Push LPM routes ==='
-    lines = []
-    for i in range(1, NODES + 1):
-        lines.append('table_add ipv4_lpm forward {}/32 => {} {}'.format(
-            BASE_IP(i), i, mac_of(NS(i), H_INTF(i))))
-    out, err = run_cli('\n'.join(lines) + '\n')
+    # ---- 7. Push LPM routes to each switch ----
+    print '\n=== 7. Push LPM routes (per switch) ==='
+    for s in range(1, N_SW + 1):
+        lines = []
+        for i in range(1, NODES + 1):
+            lines.append('table_add ipv4_lpm forward {}/32 => {} {}'.format(
+                sw_ip(i, s), i, mac_of(NS(i), H_SW_INTF(i, s))))
+        out, err = run_cli('\n'.join(lines) + '\n', thrift_port=SW_PORT[s-1])
+        print '  sw%d: %d routes' % (s, NODES)
 
     # ---- 8. Sanity: verify a direct subflow path bypasses the switch ----
     print '\n=== 8. Verify direct subflow connectivity ==='
@@ -226,7 +261,8 @@ def main():
     demo = None
     for f in flows:
         paths = set(sf.path for sf in f.subflows)
-        if 'direct' in paths and 'sw' in paths:
+        has_sw = any(p.startswith('sw') for p in paths)
+        if 'direct' in paths and has_sw:
             demo = f
             break
     if demo is None:
@@ -265,7 +301,10 @@ def main():
                 dlink = direct_links[sf.sid]
                 ipb = dlink[3].split('/')[0]
             else:
-                ipb = BASE_IP(demo.dst)
+                # switch path -> use that switch's subnet address
+                sw_idx = int(sf.path[2]) - 1     # 'sw1'->0 'sw2'->1 'sw3'->2
+                s = sw_idx + 1
+                ipb = sw_ip(demo.dst, s)
             send_dest.append((ipb, k))
         send_body = (
             'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
@@ -337,7 +376,7 @@ def demo_3domain():
         dir_rates = [sched.rate[f.subflows[0].sid] for f in flows
                      if f.subflows[0].path == 'direct']
         sw_rates = [sched.rate[sf.sid] for f in flows for sf in f.subflows
-                    if sf.path == 'sw']
+                    if sf.path.startswith('sw')]
         avg_dir = sum(dir_rates) / max(len(dir_rates), 1)
         avg_sw = sum(sw_rates) / max(len(sw_rates), 1)
         print '  rnd %d: ecn=%.2f state=%d rl=%.2f avg_direct=%.2f avg_sw=%.2f' % (

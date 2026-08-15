@@ -20,7 +20,8 @@ import random
 
 # path constants
 PATH_DIRECT = 'direct'
-PATH_SWITCH = 'sw'
+# multiple switches -> genuinely heterogeneous switch paths
+PATH_SWITCHES = ['sw1', 'sw2', 'sw3']
 
 
 class Subflow(object):
@@ -69,8 +70,15 @@ class Flow(object):
         self.src = src
         self.dst = dst
         self.subflows = []
+        sw_idx = 0
         for k in range(n_subflows):
-            path = PATH_DIRECT if (direct_ok and k == 0) else PATH_SWITCH
+            if direct_ok and k == 0:
+                path = PATH_DIRECT
+            else:
+                # assign each switch subflow to a DIFFERENT switch
+                # (round-robin over sw1/sw2/sw3) -> genuinely heterogeneous
+                path = PATH_SWITCHES[sw_idx % len(PATH_SWITCHES)]
+                sw_idx += 1
             self.subflows.append(
                 Subflow('%d.%d' % (fid, k), src, dst, path))
         # DSN-axis state (whole connection)
@@ -78,7 +86,9 @@ class Flow(object):
         self.dsn_received = 0
         self.reorder_buf = {}          # dsn -> payload (out-of-order held)
 
-    def add_subflow(self, path=PATH_SWITCH):
+    def add_subflow(self, path=None):
+        if path is None:
+            path = PATH_SWITCHES[0]
         sf = Subflow('%d.%d' % (self.fid, len(self.subflows)),
                      self.src, self.dst, path)
         self.subflows.append(sf)
@@ -114,15 +124,19 @@ def build_mptcp_graph(nodes, min_sub=3, max_sub=4, min_dst=1, max_dst=3,
 
 
 def count_by_path(flows):
-    """Count subflows by path for diagnostics."""
-    n_dir = sum(1 for f in flows for sf in f.subflows if sf.path == PATH_DIRECT)
-    n_sw = sum(1 for f in flows for sf in f.subflows if sf.path == PATH_SWITCH)
-    return n_dir, n_sw
+    """Count subflows by path for diagnostics. Returns a dict."""
+    counts = {PATH_DIRECT: 0}
+    for sw in PATH_SWITCHES:
+        counts[sw] = 0
+    for f in flows:
+        for sf in f.subflows:
+            counts[sf.path] = counts.get(sf.path, 0) + 1
+    return counts
 
 
 if __name__ == '__main__':
     flows, pairs = build_mptcp_graph(range(1, 17), seed=3)
-    nd, ns = count_by_path(flows)
-    print 'flows:', len(flows), ' direct subflows:', nd, ' switch subflows:', ns
+    counts = count_by_path(flows)
+    print 'flows:', len(flows), ' subflow counts:', counts
     for f in flows[:5]:
         print ' ', f, '->', [sf.path for sf in f.subflows]
