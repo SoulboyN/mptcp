@@ -97,6 +97,10 @@ class TcpSocket(object):
 
         # external interface: the scheduler can set the target cwnd directly
         self.ctrl_cwnd = None        # RL-set cwnd override (None = algorithm)
+        # retransmission path: the scheduler sets this to a HEALTHIER path
+        # (see RlPathSelector.select_retrans_subflow) so a dropped segment
+        # is retransmitted over a different, more reliable path.
+        self.retrans_to = None
 
     # ---- helpers ----
     def _effective_cwnd(self):
@@ -185,7 +189,9 @@ class TcpSocket(object):
 
     # ---- retransmission ----
     def on_timeout(self, now):
-        """RTO timeout: retransmit oldest unacked, back off RTO."""
+        """RTO timeout: retransmit oldest unacked, back off RTO. The
+        scheduler may set self.retrans_to to a healthier path; the caller
+        sends the returned segment over that path."""
         if not self.unacked:
             return None
         oldest_seq = min(self.unacked)

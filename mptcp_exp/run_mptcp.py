@@ -386,6 +386,46 @@ def main():
         else:
             print '  [!] receiver got 0 segments - reorder NOT verified'
 
+    # ---- 9b. Proportional split + retransmission path selection ----
+    # Demonstrate the two new scheduler abilities in-process:
+    #   (1) continuous proportional traffic split across heterogeneous paths
+    #   (2) on packet loss, retransmit over the healthiest path
+    print '\n=== 9b. Proportional split + retrans-path selection ==='
+    import mptcp_scheduler as sch
+    sel = sch.RlPathSelector(flows, n_sw=3)
+    for f in flows:
+        for sf in f.subflows:
+            class _Sock(object):
+                pass
+            s = _Sock()
+            s.in_flight = 0
+            s._effective_cwnd = lambda: 10
+            s.ctrl_cwnd = None
+            sel.sockets[sf.sid] = s
+    # scenario: sw2 (cellular) congested + expensive, sw1 free, direct cheap
+    sel.observe({1: 0.1, 2: 0.9, 3: 0.0})
+    # pick a flow with 3+ subflows for a clear split
+    demo2 = None
+    for f in flows:
+        if len(f.subflows) >= 3:
+            demo2 = f
+            break
+    if demo2:
+        w = sel.path_weights(demo2)
+        print '  flow %d path weights: %s' % (
+            demo2.fid, {sf.path: round(w[sf.sid], 3) for sf in demo2.subflows})
+        from collections import Counter
+        cnt = Counter()
+        for _ in range(500):
+            sid = sel.pick_by_ratio(demo2)
+            for sf in demo2.subflows:
+                if sf.sid == sid:
+                    cnt[sf.path] += 1
+                    break
+        print '  500 segments split:', dict(cnt)
+        rsf = sel.select_retrans_subflow(demo2)
+        print '  retransmission healthiest path:', rsf.path
+
     # ---- 10. M5-M7: three-domain congestion control demo ----
     demo_3domain()
 

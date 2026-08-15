@@ -261,6 +261,42 @@ class RlPathSelector(object):
         best = min(cand, key=self._path_pressure)
         return best
 
+    # ---- continuous proportional traffic split ----
+    def path_weights(self, flow):
+        """Continuous per-path weights (inverse of pressure): a less
+        pressured / cheaper / less congested path gets a larger share.
+        Returns {subflow.sid: weight} for this flow's subflows."""
+        pressures = {sf.sid: max(self._path_pressure(sf), 0.05)
+                     for sf in flow.subflows}
+        inv = {sid: 1.0 / p for sid, p in pressures.items()}
+        total = sum(inv.values()) or 1.0
+        return {sid: w / total for sid, w in inv.items()}
+
+    def pick_by_ratio(self, flow):
+        """Pick a subflow for the next DSN segment by the continuous
+        proportional weights (weighted random). This is the "split traffic
+        across heterogeneous paths by ratio" the RL policy drives."""
+        import random
+        weights = self.path_weights(flow)
+        sids = list(weights.keys())
+        probs = [weights[s] for s in sids]
+        r = random.random() * sum(probs)
+        acc = 0.0
+        for sid, p in zip(sids, probs):
+            acc += p
+            if r <= acc:
+                return sid
+        return sids[-1]
+
+    # ---- retransmission: pick the healthiest path ----
+    def select_retrans_subflow(self, flow):
+        """For a DROP/RETRANSMIT, choose the currently healthiest path:
+        lowest pressure (ECN + occupancy + cost). Ignores the original
+        path, so a retransmitted segment avoids the path that dropped."""
+        if not flow.subflows:
+            return None
+        return min(flow.subflows, key=self._path_pressure)
+
     def observe(self, sw_ecn_map):
         """Update per-switch ECN (the SDN global view of each switch)."""
         for s, v in sw_ecn_map.items():
