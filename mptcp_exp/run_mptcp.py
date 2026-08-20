@@ -335,21 +335,22 @@ def main():
     if demo is None:
         print '  no flow with both path types; skipping'
     else:
-        import mptcp_io
+        import mptcp_tcp
         port = 7000
         sub = demo.subflows
         n_dir = len([sf for sf in sub if sf.path == 'direct'])
         n_sw = len(sub) - n_dir
-        print '  demo flow %d: %d direct + %d switch subflows' % (
+        print '  demo flow %d: %d direct + %d switch subflows (real TCP)' % (
             demo.fid, n_dir, n_sw)
-        # start receiver on the destination node
+        # receiver: accept N TCP connections (one per subflow), reorder by DSN
+        n_sub = len(sub)
         recv_body = (
             'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-            'import mptcp_io\n'
-            'r = mptcp_io.DsnReceiver(%d, timeout=8)\n'
-            'o = r.recv_loop(8)\n'
+            'import mptcp_tcp\n'
+            'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=10)\n'
+            'o = r.recv_loop(9)\n'
             'print "OK", r.stats()\n'
-        ) % port
+        ) % (port, n_sub)
         with open('/tmp/mptcp_recv.py', 'w') as f:
             f.write(recv_body)
         recv_proc = subprocess.Popen(
@@ -357,10 +358,7 @@ def main():
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         time.sleep(1)
 
-        # send 20 segments per subflow, interleaved DSN across subflows,
-        # so the receiver must reorder (subflows send out of DSN order).
-        # SENDERS MUST RUN INSIDE THE SOURCE NAMESPACE (their sockets live
-        # there and only there can reach the direct /30 or switch subnet).
+        # send 20 segments per subflow over REAL kernel TCP, interleaved DSN
         segs_per_sub = 20
         send_dest = []
         for k, sf in enumerate(sub):
@@ -368,18 +366,17 @@ def main():
                 dlink = direct_links[sf.sid]
                 ipb = dlink[3].split('/')[0]
             else:
-                # switch path -> use that switch's subnet address
-                sw_idx = int(sf.path[2]) - 1     # 'sw1'->0 'sw2'->1 'sw3'->2
+                sw_idx = int(sf.path[2]) - 1
                 s = sw_idx + 1
                 ipb = sw_ip(demo.dst, s)
             send_dest.append((ipb, k))
         send_body = (
             'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-            'import mptcp_io, time\n'
+            'import mptcp_tcp, time\n'
             'senders = []\n'
         )
         for ipb, k in send_dest:
-            send_body += 'senders.append(mptcp_io.SsnSender("%s", %d, "%d.%d", sid_int=%d))\n' % (
+            send_body += 'senders.append(mptcp_tcp.TcpSsnSender("%s", %d, "%d.%d", sid_int=%d))\n' % (
                 ipb, port, demo.fid, k, k)
         send_body += (
             'for i in range(%d):\n'
@@ -546,6 +543,16 @@ def main():
         traceback.print_exc()
         print '  [!] real-env training skipped:', e
 
+    # ---- 11. Interactive MPTCP resilience demo (real kernel TCP) ----
+    # Interactive terminal: user can cut a subflow path (WLAN/cellular
+    # drop) and watch data continue over the remaining paths.
+    try:
+        demo_interactive(flows, pairs, direct_links)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print '  [!] interactive demo skipped:', e
+
     print '\n=== Done (topology up) ==='
     print 'Ctrl-C to cleanup.'
 
@@ -585,6 +592,153 @@ def demo_3domain():
             rnd, ratio, state, m, avg_dir, avg_sw)
         time.sleep(0.3)
     print '  [*] direct subflows keep rate (DCQCN only cuts switch subflows)'
+
+
+def demo_interactive(flows, pairs, direct_links):
+    """Interactive terminal demo of MPTCP resilience over REAL kernel TCP.
+
+    The user can cut a subflow path (simulating WLAN / cellular drop) and
+    watch data continue over the remaining paths. Commands:
+      cut <path>   -> bring down that path (direct / sw1 / sw2 / sw3)
+      up  <path>   -> bring the path back
+      quit         -> exit
+    Cutting a path physically disables its veth interfaces in the
+    relevant namespaces, so real TCP connections over it break; the other
+    subflows keep delivering data (MPTCP path resilience).
+    """
+    import mptcp_tcp
+    # sw_ip: node i's address on switch s's subnet (module-level map)
+    _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    def sw_ip(i, s):
+        return '{}.{}'.format(_SW_NET[s], i)
+    demo = None
+    for f in flows:
+        if len(f.subflows) >= 3:
+            demo = f
+            break
+    if demo is None:
+        print '  [!] no flow with >=3 subflows; skipping interactive'
+        return
+    port = 7900
+    n_sub = len(demo.subflows)
+    print '\n=== 11. Interactive MPTCP resilience (real kernel TCP) ==='
+    print '  flow %d: %d subflows over real TCP; receiver on %s' % (
+        demo.fid, n_sub, demo.dst)
+    # receiver: accept n_sub TCP connections, reorder by DSN
+    recv_body = (
+        'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+        'import mptcp_tcp\n'
+        'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=30)\n'
+        'o = r.recv_loop(30)\n'
+        'print "OK", r.stats()\n'
+    ) % (port, n_sub)
+    with open('/tmp/mptcp_recv_i.py', 'w') as f:
+        f.write(recv_body)
+    recv_proc = subprocess.Popen(
+        'ip netns exec {} python2 -u /tmp/mptcp_recv_i.py'.format(NS(demo.dst)),
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(1)
+
+    # paths that are currently up
+    up = {sf.path: True for sf in demo.subflows}
+
+    # The senders must run INSIDE the source namespace (that's where the
+    # routes to each path's dst IP exist). We write a sender script and run
+    # it via `ip netns exec`, while this process handles the interactive
+    # cut/up/quit loop by toggling veth interfaces.
+    send_dest = []
+    for k, sf in enumerate(demo.subflows):
+        if sf.path == 'direct':
+            dlink = direct_links[sf.sid]
+            ipb = dlink[3].split('/')[0]
+        else:
+            sw_idx = int(sf.path[2]) - 1
+            ipb = sw_ip(demo.dst, sw_idx + 1)
+        send_dest.append((ipb, k))
+    snd_body = (
+        'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+        'import mptcp_tcp, time\n'
+        'senders = []\n'
+    )
+    for ipb, k in send_dest:
+        snd_body += ('senders.append(mptcp_tcp.TcpSsnSender("%s", %d, "%d.%d", sid_int=%d))\n'
+                     % (ipb, port, demo.fid, k, k))
+    snd_body += (
+        'dsn = 0\n'
+        'try:\n'
+        '    while True:\n'
+        '        for k, s in enumerate(senders):\n'
+        '            try:\n'
+        '                s.send_seg(%d, dsn, payload=b"I%%03d" %% dsn)\n'
+        '            except Exception:\n'
+        '                pass\n'
+        '            dsn += 1\n'
+        '            time.sleep(0.01)\n'
+        'except KeyboardInterrupt:\n'
+        '    pass\n'
+    ) % demo.fid
+    with open('/tmp/mptcp_send_i.py', 'w') as f:
+        f.write(snd_body)
+    snd_proc = subprocess.Popen(
+        'ip netns exec {} python2 -u /tmp/mptcp_send_i.py'.format(NS(demo.src)),
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def path_ifaces(path):
+        """veth interfaces for a path on the demo source+dst nodes."""
+        ifaces = []
+        for node in (demo.src, demo.dst):
+            if path == 'direct':
+                # find the direct link iface for this (src,dst)
+                for sid, (a, b, ipa, ipb) in direct_links.items():
+                    for ff in flows:
+                        for sf in ff.subflows:
+                            if sf.sid == sid and sf.path == 'direct' \
+                               and ff.src == demo.src and ff.dst == demo.dst:
+                                ifaces += [a, b]
+                                break
+            else:
+                sw_idx = int(path[2]) - 1
+                ifaces.append(H_SW_INTF(node, sw_idx + 1))
+        return list(set(ifaces))
+
+    print '  interactive: type "cut <path>", "up <path>", or "quit"'
+    print '  paths: ' + ', '.join(sorted(set(sf.path for sf in demo.subflows)))
+    try:
+        while True:
+            try:
+                line = raw_input('mptcp> ')
+            except EOFError:
+                break
+            parts = line.strip().split()
+            if not parts:
+                continue
+            cmd, arg = parts[0], (parts[1] if len(parts) > 1 else '')
+            if cmd == 'quit':
+                break
+            elif cmd == 'cut' and arg:
+                # bring down the path's veth interfaces
+                for ifc in path_ifaces(arg):
+                    sh_quiet('ip link set {} down 2>/dev/null'.format(ifc))
+                    sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'.format(
+                        demo.src if 'h%d-' % demo.src in ifc else demo.dst, ifc))
+                up[arg] = False
+                print '  [-] path %s cut (data will reroute)' % arg
+            elif cmd == 'up' and arg:
+                for ifc in path_ifaces(arg):
+                    sh_quiet('ip link set {} up 2>/dev/null'.format(ifc))
+                up[arg] = True
+                print '  [+] path %s restored' % arg
+    except KeyboardInterrupt:
+        pass
+    snd_proc.terminate()
+    try:
+        snd_proc.wait(timeout=3)
+    except Exception:
+        pass
+    # let the receiver collect the tail of what was sent before reading
+    time.sleep(3)
+    out = recv_proc.stdout.read()
+    print '  receiver final:', out.strip()
 
 
 if __name__ == '__main__':

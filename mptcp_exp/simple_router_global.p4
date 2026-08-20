@@ -37,14 +37,31 @@ header udp_t {
     bit<16> checksum;
 }
 
+header tcp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<32> seqNo;
+    bit<32> ackNo;
+    bit<4>  dataOffset;
+    bit<4>  res;
+    bit<8>  flags;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgentPtr;
+}
+
 struct headers {
     ethernet_t eth;
     ipv4_t     ipv4;
     udp_t      udp;
+    tcp_t      tcp;
 }
 
 struct meta {
     bit<32> portIdx;
+    // pre-computed pseudo-header pieces for TCP checksum (no casts allowed
+    // inside update_checksum): zero-padded protocol, tcp length
+    bit<16> tcp_len16;
 }
 
 parser p(packet_in pkt, out headers h, inout meta m, inout standard_metadata_t sm) {
@@ -59,11 +76,16 @@ parser p(packet_in pkt, out headers h, inout meta m, inout standard_metadata_t s
         pkt.extract(h.ipv4);
         transition select(h.ipv4.protocol) {
             17: parse_udp;
+            6:  parse_tcp;
             default: accept;
         }
     }
     state parse_udp {
         pkt.extract(h.udp);
+        transition accept;
+    }
+    state parse_tcp {
+        pkt.extract(h.tcp);
         transition accept;
     }
 }
@@ -87,6 +109,11 @@ control ingress(inout headers h, inout meta m, inout standard_metadata_t sm) {
         // zero it so the receiving kernel accepts the forwarded datagram.
         if (h.udp.isValid()) {
             h.udp.checksum = 0;
+        }
+        // pre-compute TCP length = ip totalLen - ip header (20 bytes),
+        // for the TCP pseudo-header checksum (no casts inside the call).
+        if (h.tcp.isValid()) {
+            m.tcp_len16 = h.ipv4.totalLen - 20;
         }
         // 0-based egress port index so it matches register indices (0..15).
         m.portIdx = (bit<32>)(port - 1);
@@ -170,6 +197,20 @@ control compute(inout headers h, inout meta m) {
               h.ipv4.srcAddr, h.ipv4.dstAddr },
             h.ipv4.hdrChecksum,
             HashAlgorithm.csum16);
+        // BMv2 forwarding changes the IPv4 header (TTL), which invalidates
+        // the TCP checksum (it covers the pseudo-header + TCP header +
+        // payload). Recompute it so the receiving kernel accepts the
+        // segment. TCP checksum CANNOT be zeroed (unlike UDP), so we must
+        // recompute with payload.
+        // pseudo-header: src(4) dst(4) [8w0+proto](2) tcp_len(2)
+        update_checksum_with_payload(
+            h.tcp.isValid(),
+            { h.ipv4.srcAddr, h.ipv4.dstAddr, 8w0, h.ipv4.protocol,
+              m.tcp_len16, h.tcp.srcPort, h.tcp.dstPort,
+              h.tcp.seqNo, h.tcp.ackNo, h.tcp.dataOffset, h.tcp.res,
+              h.tcp.flags, h.tcp.window, h.tcp.urgentPtr },
+            h.tcp.checksum,
+            HashAlgorithm.csum16);
     }
 }
 
@@ -178,6 +219,7 @@ control dep(packet_out pkt, in headers h) {
         pkt.emit(h.eth);
         pkt.emit(h.ipv4);
         pkt.emit(h.udp);
+        pkt.emit(h.tcp);
     }
 }
 
