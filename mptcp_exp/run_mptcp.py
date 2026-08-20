@@ -546,14 +546,20 @@ def main():
     # ---- 11. Interactive MPTCP resilience demo (real kernel TCP) ----
     # Interactive terminal: user can cut a subflow path (WLAN/cellular
     # drop) and watch data continue over the remaining paths.
-    # If --cut <path> was given on the command line, cut that path
-    # automatically and skip the interactive prompt (useful in non-tty
-    # environments where raw_input has no keyboard).
+    # Non-interactive alternatives (no tty needed):
+    #   --cut <path>        cut one path at the start, observe reroute
+    #   --demo "seq"        run a scripted cut/up/sleep sequence, e.g.
+    #                       "sleep 3|cut sw1|sleep 5|up sw1|sleep 5|cut sw2|sleep 5"
     cut_arg = None
-    if len(sys.argv) > 2 and sys.argv[1] == '--cut':
-        cut_arg = sys.argv[2]
+    demo_seq = None
+    if len(sys.argv) > 2:
+        if sys.argv[1] == '--cut':
+            cut_arg = sys.argv[2]
+        elif sys.argv[1] == '--demo':
+            demo_seq = sys.argv[2].split('|')
     try:
-        demo_interactive(flows, pairs, direct_links, auto_cut=cut_arg)
+        demo_interactive(flows, pairs, direct_links,
+                         auto_cut=cut_arg, auto_demo=demo_seq)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -600,7 +606,7 @@ def demo_3domain():
     print '  [*] direct subflows keep rate (DCQCN only cuts switch subflows)'
 
 
-def demo_interactive(flows, pairs, direct_links, auto_cut=None):
+def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
     """Interactive terminal demo of MPTCP resilience over REAL kernel TCP.
 
     The user can cut a subflow path (simulating WLAN / cellular drop) and
@@ -610,6 +616,8 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None):
       quit         -> exit
     If `auto_cut` is provided, that path is cut automatically at the start
     (no interactive input needed) -- useful in non-tty environments.
+    If `auto_demo` is provided, a scripted cut/up/sleep sequence is run
+    (e.g. ["sleep 3", "cut sw1", "sleep 5", "up sw1", "sleep 5", "quit"]).
     Cutting a path physically disables its veth interfaces in the
     relevant namespaces, so real TCP connections over it break; the other
     subflows keep delivering data (MPTCP path resilience).
@@ -666,30 +674,23 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None):
     snd_body = (
         'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
         'import mptcp_tcp, time\n'
-        'senders = []\n'
-    )
-    for ipb, k in send_dest:
-        snd_body += ('senders.append(mptcp_tcp.TcpSsnSender("%s", %d, "%d.%d", sid_int=%d))\n'
-                     % (ipb, port, demo.fid, k, k))
-    snd_body += (
+        'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d)\n'
         'dsn = 0\n'
         'try:\n'
         '    while True:\n'
-        '        for k, s in enumerate(senders):\n'
-        '            try:\n'
-        '                s.send_seg(%d, dsn, payload=b"I%%03d" %% dsn)\n'
-        '            except Exception:\n'
-        '                pass\n'
-        '            dsn += 1\n'
-        '            time.sleep(0.01)\n'
+        '        g.send_next(dsn)\n'
+        '        dsn += 1\n'
+        '        time.sleep(0.01)\n'
         'except KeyboardInterrupt:\n'
         '    pass\n'
-    ) % demo.fid
+    ) % (demo.fid, [(ipb, k) for ipb, k in send_dest], port)
     with open('/tmp/mptcp_send_i.py', 'w') as f:
         f.write(snd_body)
+    snd_out = open('/tmp/mptcp_send_i.out', 'w')
     snd_proc = subprocess.Popen(
         'ip netns exec {} python2 -u /tmp/mptcp_send_i.py'.format(NS(demo.src)),
-        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        shell=True, preexec_fn=os.setsid,
+        stdout=snd_out, stderr=subprocess.STDOUT)
 
     def path_ifaces(path):
         """veth interfaces for a path on the demo source+dst nodes."""
@@ -712,50 +713,90 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None):
     print '  interactive: type "cut <path>", "up <path>", or "quit"'
     print '  paths: ' + ', '.join(sorted(set(sf.path for sf in demo.subflows)))
 
+    import re as _re
+    def _node_of(ifc):
+        m = _re.match(r'h(\d+)-', ifc)
+        return int(m.group(1)) if m else None
+
     def cut_path(path):
-        """Bring a path's veth interfaces down; returns True if cut."""
+        """Bring a path's veth interfaces down (both ends); data reroutes."""
         if path not in up:
             print '  [!] unknown path:', path
             return
         for ifc in path_ifaces(path):
-            sh_quiet('ip link set {} down 2>/dev/null'.format(ifc))
-            sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'.format(
-                demo.src if 'h%d-' % demo.src in ifc else demo.dst, ifc))
+            n = _node_of(ifc)
+            if n is not None:
+                sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'
+                         .format(n, ifc))
         up[path] = False
         print '  [-] path %s cut (data will reroute)' % path
 
     def up_path(path):
+        """Restore a path's interfaces so its subflow can reconnect."""
         if path not in up:
             print '  [!] unknown path:', path
             return
         for ifc in path_ifaces(path):
-            sh_quiet('ip link set {} up 2>/dev/null'.format(ifc))
+            n = _node_of(ifc)
+            if n is not None:
+                sh_quiet('ip netns exec ns-h{} ip link set {} up 2>/dev/null'
+                         .format(n, ifc))
         up[path] = True
         print '  [+] path %s restored' % path
 
-    if auto_cut:
-        print '  [auto] cutting path:', auto_cut
-        cut_path(auto_cut)
-
-    try:
-        while True:
-            try:
-                line = raw_input('mptcp> ')
-            except EOFError:
-                break
-            parts = line.strip().split()
+    if auto_demo:
+        print '  [demo] scripted sequence: %s' % ' | '.join(auto_demo)
+        for step in auto_demo:
+            parts = step.strip().split()
             if not parts:
                 continue
             cmd, arg = parts[0], (parts[1] if len(parts) > 1 else '')
-            if cmd == 'quit':
-                break
+            if cmd == 'sleep':
+                print '  [demo]   waiting %.1fs...' % float(arg)
+                time.sleep(float(arg))
             elif cmd == 'cut' and arg:
                 cut_path(arg)
             elif cmd == 'up' and arg:
                 up_path(arg)
-    except KeyboardInterrupt:
-        pass
-    snd_proc.terminate()
+            elif cmd == 'quit':
+                break
+    elif auto_cut:
+        print '  [auto] cutting path:', auto_cut
+        cut_path(auto_cut)
+        # In auto mode, let the sender keep running a few seconds so data
+        # visibly reroutes over the remaining paths, then exit cleanly
+        # (no interactive prompt, which would hang without a TTY).
+        print '  [auto] letting data reroute over remaining paths for 5s...'
+        time.sleep(5)
+        print '  [auto] done (type "quit" was not needed; auto-exit)'
+    else:
+        try:
+            while True:
+                try:
+                    line = raw_input('mptcp> ')
+                except EOFError:
+                    break
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                cmd, arg = parts[0], (parts[1] if len(parts) > 1 else '')
+                if cmd == 'quit':
+                    break
+                elif cmd == 'cut' and arg:
+                    cut_path(arg)
+                elif cmd == 'up' and arg:
+                    up_path(arg)
+        except KeyboardInterrupt:
+            pass
+    # terminate the sender AND its child python2 (shell=True leaves an
+    # orphan otherwise); kill the whole process group
+    try:
+        os.killpg(os.getpgid(snd_proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            snd_proc.terminate()
+        except Exception:
+            pass
     try:
         snd_proc.wait(timeout=3)
     except Exception:
@@ -764,6 +805,14 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None):
     time.sleep(3)
     out = recv_proc.stdout.read()
     print '  receiver final:', out.strip()
+    # print sender diagnostics (connect errors etc.)
+    try:
+        snd_out.close()
+        snd_txt = open('/tmp/mptcp_send_i.out').read().strip()
+        if snd_txt:
+            print '  sender log:', snd_txt[:400]
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
