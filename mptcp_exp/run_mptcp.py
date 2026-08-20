@@ -546,8 +546,14 @@ def main():
     # ---- 11. Interactive MPTCP resilience demo (real kernel TCP) ----
     # Interactive terminal: user can cut a subflow path (WLAN/cellular
     # drop) and watch data continue over the remaining paths.
+    # If --cut <path> was given on the command line, cut that path
+    # automatically and skip the interactive prompt (useful in non-tty
+    # environments where raw_input has no keyboard).
+    cut_arg = None
+    if len(sys.argv) > 2 and sys.argv[1] == '--cut':
+        cut_arg = sys.argv[2]
     try:
-        demo_interactive(flows, pairs, direct_links)
+        demo_interactive(flows, pairs, direct_links, auto_cut=cut_arg)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -594,7 +600,7 @@ def demo_3domain():
     print '  [*] direct subflows keep rate (DCQCN only cuts switch subflows)'
 
 
-def demo_interactive(flows, pairs, direct_links):
+def demo_interactive(flows, pairs, direct_links, auto_cut=None):
     """Interactive terminal demo of MPTCP resilience over REAL kernel TCP.
 
     The user can cut a subflow path (simulating WLAN / cellular drop) and
@@ -602,6 +608,8 @@ def demo_interactive(flows, pairs, direct_links):
       cut <path>   -> bring down that path (direct / sw1 / sw2 / sw3)
       up  <path>   -> bring the path back
       quit         -> exit
+    If `auto_cut` is provided, that path is cut automatically at the start
+    (no interactive input needed) -- useful in non-tty environments.
     Cutting a path physically disables its veth interfaces in the
     relevant namespaces, so real TCP connections over it break; the other
     subflows keep delivering data (MPTCP path resilience).
@@ -703,6 +711,32 @@ def demo_interactive(flows, pairs, direct_links):
 
     print '  interactive: type "cut <path>", "up <path>", or "quit"'
     print '  paths: ' + ', '.join(sorted(set(sf.path for sf in demo.subflows)))
+
+    def cut_path(path):
+        """Bring a path's veth interfaces down; returns True if cut."""
+        if path not in up:
+            print '  [!] unknown path:', path
+            return
+        for ifc in path_ifaces(path):
+            sh_quiet('ip link set {} down 2>/dev/null'.format(ifc))
+            sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'.format(
+                demo.src if 'h%d-' % demo.src in ifc else demo.dst, ifc))
+        up[path] = False
+        print '  [-] path %s cut (data will reroute)' % path
+
+    def up_path(path):
+        if path not in up:
+            print '  [!] unknown path:', path
+            return
+        for ifc in path_ifaces(path):
+            sh_quiet('ip link set {} up 2>/dev/null'.format(ifc))
+        up[path] = True
+        print '  [+] path %s restored' % path
+
+    if auto_cut:
+        print '  [auto] cutting path:', auto_cut
+        cut_path(auto_cut)
+
     try:
         while True:
             try:
@@ -716,18 +750,9 @@ def demo_interactive(flows, pairs, direct_links):
             if cmd == 'quit':
                 break
             elif cmd == 'cut' and arg:
-                # bring down the path's veth interfaces
-                for ifc in path_ifaces(arg):
-                    sh_quiet('ip link set {} down 2>/dev/null'.format(ifc))
-                    sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'.format(
-                        demo.src if 'h%d-' % demo.src in ifc else demo.dst, ifc))
-                up[arg] = False
-                print '  [-] path %s cut (data will reroute)' % arg
+                cut_path(arg)
             elif cmd == 'up' and arg:
-                for ifc in path_ifaces(arg):
-                    sh_quiet('ip link set {} up 2>/dev/null'.format(ifc))
-                up[arg] = True
-                print '  [+] path %s restored' % arg
+                up_path(arg)
     except KeyboardInterrupt:
         pass
     snd_proc.terminate()
