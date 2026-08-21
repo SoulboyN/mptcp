@@ -136,6 +136,8 @@ def main():
             'policy_path': pp,               # state -> profile index
             'actions_cwnd': ACTIONS_CWND,
             'policy_cwnd': pc,
+            'Q_path': Qp,                    # for real-env fine-tune init
+            'Q_cwnd': Qc,
             'env_fingerprint': env_fingerprint(),
         }, f, indent=2)
     print 'policy exported to', out

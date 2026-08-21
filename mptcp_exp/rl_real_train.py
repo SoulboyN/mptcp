@@ -74,10 +74,26 @@ class RealEnvTrainer(object):
         self.sw_ports = sw_ports            # {sw_idx: thrift_port}
         self.min_cwnd = min_cwnd
         self.max_cwnd = max_cwnd
-        # RL tables (pre-trained from offline, else fresh)
+        # RL tables: warm-start from the offline pre-trained Q tables so the
+        # real-environment fine-tune does not start from a cold blank state.
         pol = load_policy() or {}
-        self.Q_path = [[0.0] * len(PATH_ACTIONS) for _ in range(3)]
-        self.Q_cwnd = [[0.0] * len(CWND_ACTIONS) for _ in range(3)]
+        # low level: cwnd actions (3 states x 4 actions) -- same action space
+        # as the offline Q_cwnd, reuse it verbatim.
+        Qc = pol.get('Q_cwnd')
+        if Qc and len(Qc) == 3 and len(Qc[0]) == len(CWND_ACTIONS):
+            self.Q_cwnd = [list(r) for r in Qc]
+        else:
+            self.Q_cwnd = [[0.0] * len(CWND_ACTIONS) for _ in range(3)]
+        # high level: the offline policy picks a path-ratio PROFILE per state;
+        # its cheap-path share becomes the prior for preferring switch paths
+        # (wifi is free) over the direct link.
+        pp = pol.get('policy_path', [])
+        prof = pol.get('profiles', getattr(rtm, 'PROFILES', []))
+        self.Q_path = []
+        for s in range(3):
+            idx = pp[s] if s < len(pp) and pp[s] < len(prof) else 1
+            cheap = prof[idx][0]
+            self.Q_path.append([cheap, 1.0 - cheap])   # [sw, direct]
         # per-subflow state
         self.cwnd = {}
         self.in_flight = {}
@@ -194,5 +210,12 @@ class RealEnvTrainer(object):
                 'Q_cwnd': self.Q_cwnd,
                 'actions_path': PATH_ACTIONS,
                 'actions_cwnd': CWND_ACTIONS,
+                # greedy policies consumed by the runtime schedulers
+                'policy_path': [max(range(len(PATH_ACTIONS)),
+                                    key=lambda i: self.Q_path[s][i])
+                                for s in range(3)],
+                'policy_cwnd': [max(range(len(CWND_ACTIONS)),
+                                    key=lambda i: self.Q_cwnd[s][i])
+                                for s in range(3)],
             }, f, indent=2)
         return path

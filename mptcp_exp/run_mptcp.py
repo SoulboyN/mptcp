@@ -34,6 +34,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 P4FILE = os.path.join(_HERE, 'simple_router_global.p4')
 JSON   = os.path.join(_HERE, 'build', 'simple_router_global.json')
 P4INFO = os.path.join(_HERE, 'build', 'simple_router_global.p4info.txt')
+# RL fine-tune output; loaded by the schedulers so the learned policy drives
+# the runtime decisions (missing on first run -> schedulers fall back to
+# their built-in defaults, then the fine-tuned policy takes over next run).
+POLICY_REAL = os.path.join(_HERE, 'policy_mptcp_real.json')
 
 NODES = 16
 NET = '10.0.0'
@@ -411,7 +415,7 @@ def main():
     #   (2) on packet loss, retransmit over the healthiest path
     print '\n=== 9b. Proportional split + retrans-path selection ==='
     import mptcp_scheduler as sch
-    sel = sch.RlPathSelector(flows, n_sw=3)
+    sel = sch.RlPathSelector(flows, n_sw=3, policy_path=POLICY_REAL)
     for f in flows:
         for sf in f.subflows:
             class _Sock(object):
@@ -577,7 +581,7 @@ def demo_3domain():
     import flow_mptcp as fmod
     import mptcp_scheduler as sch
     flows, pairs = fmod.build_mptcp_graph(range(1, 17), seed=3)
-    sched = sch.MptcpScheduler(flows)
+    sched = sch.MptcpScheduler(flows, policy_path=POLICY_REAL)
     print '\n=== M5-M7: three-domain congestion control demo ==='
     print '  flows:', len(flows), ' subflows:', sum(len(f.subflows) for f in flows)
 

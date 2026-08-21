@@ -29,8 +29,12 @@ class MptcpScheduler(object):
         if policy_path and os.path.exists(policy_path):
             with open(policy_path) as f:
                 cfg = json.load(f)
-            self.actions_lo = cfg.get('actions_lo', ACTIONS_LO)
-            self.policy_lo = cfg.get('policy_flow', POLICY_LO)
+            if 'policy_cwnd' in cfg:                 # rl_real_train output
+                self.actions_lo = cfg.get('actions_cwnd', ACTIONS_LO)
+                self.policy_lo = cfg.get('policy_cwnd', POLICY_LO)
+            else:                                     # legacy rate policy
+                self.actions_lo = cfg.get('actions_lo', ACTIONS_LO)
+                self.policy_lo = cfg.get('policy_flow', POLICY_LO)
         else:
             self.actions_lo = ACTIONS_LO
             self.policy_lo = POLICY_LO

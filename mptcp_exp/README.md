@@ -16,8 +16,8 @@ DCQCN + Credit + RL 三域协同拥塞控制。
 | `mptcp_io.py` | DSN/SSN 标记的传输:发送端按 SSN 编号,接收端按 DSN 重组 |
 | `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 |
 | `mptcp_scheduler.py` | 多交换机感知调度:DCQCN(每交换机独立 ECN)+ Credit + RL(路径比例/cwnd/成本) |
-| `rl_train_mptcp.py` | 离线分层 Q-learning(路径比例 profile + cwnd),交替冻结训练 |
-| `rl_real_train.py` | 真实环境训练:读真实 ECN/丢包/时延做奖励,微调策略 |
+| `rl_train_mptcp.py` | 离线分层 Q-learning(路径比例 profile + cwnd),交替冻结训练;导出 Q 表数值 |
+| `rl_real_train.py` | 真实环境训练:读真实 ECN/丢包/时延做奖励,微调策略;从离线 Q **warm-start**,保存时导出 `policy_path`/`policy_cwnd` 供调度器加载 |
 | `simple_router_global.p4` | 数据面:转发 + ECN 标记 + meter 限速 |
 | `MPTCP_DESIGN.md` | 设计蓝图 |
 
@@ -58,6 +58,7 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 真实训练 | 3 交换机真实 ECN/丢包/时延驱动 RL | recv 60/60, reward 0.905, 存 policy_mptcp_real.json |
 | 断链重传 | 四层恢复:发送失败即重传 / go-back-N 重放 / NAK(最小缺失 DSN) / 停滞检测(踢出静默卡死子流) | --demo 生命周期:in_buf 0,唯一 DSN 全部按序交付 |
 | 断链重路由 | 交互 cut/up + `--cut`/`--demo` 自动演示;子流 ~2s 自动重连 | --cut sw1:received==ordered, in_buf 0 |
+| RL 策略部署 | 离线存 Q → 真实微调 **warm-start**(不冷启动)→ 保存导出 `policy_path`/`policy_cwnd` → 调度器(RlPathSelector/RlCwndController/MptcpScheduler)加载并驱动决策 | 微调后 policy_cwnd [1,1,1]→[1,0,1](state1 cwnd×2);三调度器加载单测通过 |
 
 ## 三域拥塞控制(核心)
 
