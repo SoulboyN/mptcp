@@ -61,6 +61,9 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | RL 策略部署 | 离线存 Q → 真实微调 **warm-start**(不冷启动)→ 保存导出 `policy_path`/`policy_cwnd` → 调度器(RlPathSelector/RlCwndController/MptcpScheduler)加载并驱动决策 | 微调后 policy_cwnd [1,1,1]→[1,0,1](state1 cwnd×2);三调度器加载单测通过 |
 | RL 驱动真实发送 | `MptcpGroupSender` 内嵌 `RlScheduler`:每轮读真实 ECN/credit/in_flight → 决策 cwnd + 路径权重;发送受 `in_flight < min(cwnd, credit)` 窗口约束;三域闭环(DCQCN 读真实 ecn_marks / Credit 接收方授信 / RL 全局) | step 11 实测:cwnd=16→4 时 inflight 跟随封顶(16→4);ECN 高时 state2 cwnd 减半;断链重传不回归 |
 | 监控页 M8 | DSN/SSN 二维实时监控:`build/monitor.html` 实时渲染每流 DSN 进度 + 每子流 SSN/接收/在途/cwnd/credit + 接收端重组 | 浏览器实时刷新,cwnd/inflight 随 RL 决策变化可见 |
+| 优雅结束 | 发送器 stop 文件触发:停发新 DSN → NAK 收尾补缺口 → FIN 关闭(替代强杀截断) | 尾部 in_buf 归 0 |
+| SACK 精确报缺 | receiver 回报 128-bit 缺失 DSN 位图,sender 只重传缺失段 | dup 从几十~几百降到 ~12 |
+| 多流并发演示 | step 11 同时 3 条 MPTCP 连接(各 3~4 子流),RL 全局感知(共享 ECN)经受真实跨流拥塞 | 3 流独立 receiver 统计;切一条不影响其他流 |
 
 ## 三域拥塞控制(真实闭环)
 
@@ -75,4 +78,5 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 
 ## 待办
 
-- 重传优化:发送器优雅结束(消除尾部截断);SACK 位图精确报缺(dup → ~0)
+- 对比实验 T5:RL-cwnd vs 固定 cwnd vs 伪 Reno
+- 协议语义补强:DSS 映射显式记录、动态增删子流(模拟 ADD_ADDR)

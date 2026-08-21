@@ -692,76 +692,92 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
     _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
     def sw_ip(i, s):
         return '{}.{}'.format(_SW_NET[s], i)
-    demo = None
-    for f in flows:
-        if len(f.subflows) >= 3:
-            demo = f
-            break
-    if demo is None:
+    # pick up to 3 flows with >=3 subflows as CONCURRENT MPTCP connections so
+    # the RL scheduler's global view (shared switch ECN) is exercised by real
+    # cross-flow congestion, not just a single connection.
+    demos = [f for f in flows if len(f.subflows) >= 3][:3]
+    if not demos:
         print '  [!] no flow with >=3 subflows; skipping interactive'
         return
-    port = 7900
-    n_sub = len(demo.subflows)
-    print '\n=== 11. Interactive MPTCP resilience (real kernel TCP) ==='
-    print '  flow %d: %d subflows over real TCP; receiver on %s' % (
-        demo.fid, n_sub, demo.dst)
-    # receiver: accept n_sub TCP connections, reorder by DSN
-    recv_body = (
-        'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-        'import mptcp_tcp\n'
-        'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=30)\n'
-        'o = r.recv_loop(30)\n'
-        'print "OK", r.stats()\n'
-    ) % (port, n_sub)
-    with open('/tmp/mptcp_recv_i.py', 'w') as f:
-        f.write(recv_body)
-    recv_proc = subprocess.Popen(
-        'ip netns exec {} python2 -u /tmp/mptcp_recv_i.py'.format(NS(demo.dst)),
-        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print '\n=== 11. Multi-connection MPTCP resilience (real kernel TCP) ==='
+    base_port = 7900
+    recv_procs = {}      # fid -> Popen
+    snd_procs = {}       # fid -> Popen
+    snd_outs = {}        # fid -> file
+    stopfs = {}          # fid -> stop file path
+    send_dests = {}      # fid -> [(ipb, sid, path)]
+    for fi, demo in enumerate(demos):
+        port = base_port + fi
+        n_sub = len(demo.subflows)
+        print '  flow %d: %d subflows over real TCP; receiver on node %s (port %d)' % (
+            demo.fid, n_sub, demo.dst, port)
+        # receiver: accept n_sub TCP connections, reorder by DSN
+        recv_body = (
+            'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+            'import mptcp_tcp\n'
+            'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=30)\n'
+            'o = r.recv_loop(30)\n'
+            'print "OK", r.stats()\n'
+        ) % (port, n_sub)
+        with open('/tmp/mptcp_recv_%d.py' % fi, 'w') as f:
+            f.write(recv_body)
+        rp = subprocess.Popen(
+            'ip netns exec {} python2 -u /tmp/mptcp_recv_%d.py'.format(NS(demo.dst)) % fi,
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        recv_procs[demo.fid] = rp
+        # the senders must run INSIDE each source namespace (that's where the
+        # routes to each path's dst IP exist)
+        send_dest = []
+        for k, sf in enumerate(demo.subflows):
+            if sf.path == 'direct':
+                dlink = direct_links[sf.sid]
+                ipb = dlink[3].split('/')[0]
+            else:
+                sw_idx = int(sf.path[2]) - 1
+                ipb = sw_ip(demo.dst, sw_idx + 1)
+            send_dest.append((ipb, k, sf.path))
+        send_dests[demo.fid] = send_dest
+        stopf = '/tmp/mptcp_stop_%d' % demo.fid
+        try:
+            os.remove(stopf)
+        except Exception:
+            pass
+        stopfs[demo.fid] = stopf
+        snd_body = (
+            'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+            'import mptcp_tcp\n'
+            'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r)\n'
+            'g.run_loop(stop_file=%r)\n'
+        ) % (demo.fid, send_dest, port, POLICY_REAL, stopf)
+        with open('/tmp/mptcp_send_%d.py' % fi, 'w') as f:
+            f.write(snd_body)
+        snd_outs[demo.fid] = open('/tmp/mptcp_send_%d.out' % fi, 'w')
+        sp = subprocess.Popen(
+            'ip netns exec {} python2 -u /tmp/mptcp_send_%d.py'.format(NS(demo.src)) % fi,
+            shell=True, preexec_fn=os.setsid,
+            stdout=snd_outs[demo.fid], stderr=subprocess.STDOUT)
+        snd_procs[demo.fid] = sp
     time.sleep(1)
+    # per-flow path-up state
+    up = {demo.fid: {sf.path: True for sf in demo.subflows} for demo in demos}
 
-    # paths that are currently up
-    up = {sf.path: True for sf in demo.subflows}
+    def _demo(fid):
+        for d in demos:
+            if d.fid == fid:
+                return d
+        return None
 
-    # The senders must run INSIDE the source namespace (that's where the
-    # routes to each path's dst IP exist). We write a sender script and run
-    # it via `ip netns exec`, while this process handles the interactive
-    # cut/up/quit loop by toggling veth interfaces.
-    send_dest = []
-    for k, sf in enumerate(demo.subflows):
-        if sf.path == 'direct':
-            dlink = direct_links[sf.sid]
-            ipb = dlink[3].split('/')[0]
-        else:
-            sw_idx = int(sf.path[2]) - 1
-            ipb = sw_ip(demo.dst, sw_idx + 1)
-        send_dest.append((ipb, k, sf.path))
-    stopf = '/tmp/mptcp_stop_%d' % demo.fid
-    try:
-        os.remove(stopf)
-    except Exception:
-        pass
-    snd_body = (
-        'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-        'import mptcp_tcp\n'
-        'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r)\n'
-        'g.run_loop(stop_file=%r)\n'
-    ) % (demo.fid, [(ipb, k, path) for ipb, k, path in send_dest],
-         port, POLICY_REAL, stopf)
-    with open('/tmp/mptcp_send_i.py', 'w') as f:
-        f.write(snd_body)
-    snd_out = open('/tmp/mptcp_send_i.out', 'w')
-    snd_proc = subprocess.Popen(
-        'ip netns exec {} python2 -u /tmp/mptcp_send_i.py'.format(NS(demo.src)),
-        shell=True, preexec_fn=os.setsid,
-        stdout=snd_out, stderr=subprocess.STDOUT)
+    import re as _re
+    def _node_of(ifc):
+        m = _re.match(r'h(\d+)-', ifc)
+        return int(m.group(1)) if m else None
 
-    def path_ifaces(path):
-        """veth interfaces for a path on the demo source+dst nodes."""
+    def path_ifaces(fid, path):
+        """veth interfaces for a path on the given flow's source+dst nodes."""
+        demo = _demo(fid)
         ifaces = []
         for node in (demo.src, demo.dst):
             if path == 'direct':
-                # find the direct link iface for this (src,dst)
                 for sid, (a, b, ipa, ipb) in direct_links.items():
                     for ff in flows:
                         for sf in ff.subflows:
@@ -774,39 +790,30 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
                 ifaces.append(H_SW_INTF(node, sw_idx + 1))
         return list(set(ifaces))
 
-    print '  interactive: type "cut <path>", "up <path>", or "quit"'
-    print '  paths: ' + ', '.join(sorted(set(sf.path for sf in demo.subflows)))
-
-    import re as _re
-    def _node_of(ifc):
-        m = _re.match(r'h(\d+)-', ifc)
-        return int(m.group(1)) if m else None
-
-    def cut_path(path):
-        """Bring a path's veth interfaces down (both ends); data reroutes."""
-        if path not in up:
-            print '  [!] unknown path:', path
+    def _apply_path(fid, path, state):
+        demo = _demo(fid)
+        if demo is None or path not in up.get(fid, {}):
+            print '  [!] unknown flow/path: %s %s' % (fid, path)
             return
-        for ifc in path_ifaces(path):
+        for ifc in path_ifaces(fid, path):
             n = _node_of(ifc)
             if n is not None:
-                sh_quiet('ip netns exec ns-h{} ip link set {} down 2>/dev/null'
-                         .format(n, ifc))
-        up[path] = False
-        print '  [-] path %s cut (data will reroute)' % path
+                sh_quiet('ip netns exec ns-h{} ip link set {} {} 2>/dev/null'
+                         .format(n, ifc, state))
+        up[fid][path] = (state == 'up')
+        print '  [%s] flow %d path %s' % ('-' if state == 'down' else '+', fid, path)
 
-    def up_path(path):
-        """Restore a path's interfaces so its subflow can reconnect."""
-        if path not in up:
-            print '  [!] unknown path:', path
-            return
-        for ifc in path_ifaces(path):
-            n = _node_of(ifc)
-            if n is not None:
-                sh_quiet('ip netns exec ns-h{} ip link set {} up 2>/dev/null'
-                         .format(n, ifc))
-        up[path] = True
-        print '  [+] path %s restored' % path
+    print '  interactive: cut/up <flow_id> <path> (e.g. "cut 0 sw1"), or "quit"'
+    print '  flows: %s' % {d.fid: [sf.path for sf in d.subflows] for d in demos}
+
+    def _cmd_flow_path(parts):
+        """Parse cut/up command -> (action, fid, path). Accepts "cut sw1",
+        "cut 1 sw1", "sw1", "1 sw1" (fid defaults to the first flow)."""
+        action = parts[0] if parts[0] in ('cut', 'up') else 'cut'
+        rest = parts[1:] if parts[0] in ('cut', 'up') else parts
+        if len(rest) >= 2 and rest[0].isdigit():
+            return action, int(rest[0]), rest[1]
+        return action, demos[0].fid, rest[0]
 
     if auto_demo:
         print '  [demo] scripted sequence: %s' % ' | '.join(auto_demo)
@@ -814,25 +821,22 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
             parts = step.strip().split()
             if not parts:
                 continue
-            cmd, arg = parts[0], (parts[1] if len(parts) > 1 else '')
+            cmd = parts[0]
             if cmd == 'sleep':
-                print '  [demo]   waiting %.1fs...' % float(arg)
-                time.sleep(float(arg))
-            elif cmd == 'cut' and arg:
-                cut_path(arg)
-            elif cmd == 'up' and arg:
-                up_path(arg)
+                print '  [demo]   waiting %.1fs...' % float(parts[1])
+                time.sleep(float(parts[1]))
+            elif cmd in ('cut', 'up'):
+                action, fid, path = _cmd_flow_path(parts)
+                _apply_path(fid, path, 'down' if cmd == 'cut' else 'up')
             elif cmd == 'quit':
                 break
     elif auto_cut:
-        print '  [auto] cutting path:', auto_cut
-        cut_path(auto_cut)
-        # In auto mode, let the sender keep running a few seconds so data
-        # visibly reroutes over the remaining paths, then exit cleanly
-        # (no interactive prompt, which would hang without a TTY).
+        print '  [auto] cutting:', auto_cut
+        action, fid, path = _cmd_flow_path(auto_cut.split())
+        _apply_path(fid, path, 'down')
         print '  [auto] letting data reroute over remaining paths for 5s...'
         time.sleep(5)
-        print '  [auto] done (type "quit" was not needed; auto-exit)'
+        print '  [auto] done'
     else:
         try:
             while True:
@@ -843,47 +847,50 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
                 parts = line.strip().split()
                 if not parts:
                     continue
-                cmd, arg = parts[0], (parts[1] if len(parts) > 1 else '')
+                cmd = parts[0]
                 if cmd == 'quit':
                     break
-                elif cmd == 'cut' and arg:
-                    cut_path(arg)
-                elif cmd == 'up' and arg:
-                    up_path(arg)
+                elif cmd in ('cut', 'up') and len(parts) >= 2:
+                    action, fid, path = _cmd_flow_path(parts)
+                    _apply_path(fid, path, 'down' if cmd == 'cut' else 'up')
         except KeyboardInterrupt:
             pass
-    # graceful stop: signal the sender to stop assigning new DSNs, let it
-    # recover the in-flight tail (NAK) and close subflows (FIN), so the
-    # receiver drains a complete ordered stream instead of a truncated one.
-    try:
-        with open('/tmp/mptcp_stop_%d' % demo.fid, 'w'):
-            pass
-        snd_proc.wait(timeout=6)
-    except Exception:
-        # fallback: kill the sender's process group (incl. child python2)
+    # graceful stop ALL senders: signal them to stop assigning new DSNs, let
+    # each recover its in-flight tail (NAK) and close subflows (FIN), so the
+    # receivers drain complete ordered streams instead of truncated ones.
+    for fid, sp in snd_procs.items():
         try:
-            os.killpg(os.getpgid(snd_proc.pid), signal.SIGTERM)
+            with open(stopfs[fid], 'w'):
+                pass
+            sp.wait(timeout=6)
         except Exception:
             try:
-                snd_proc.terminate()
+                os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
             except Exception:
-                pass
+                try:
+                    sp.terminate()
+                except Exception:
+                    pass
     try:
-        snd_proc.wait(timeout=3)
+        for fid, sp in snd_procs.items():
+            sp.wait(timeout=3)
     except Exception:
         pass
-    # let the receiver collect the tail of what was sent before reading
     time.sleep(3)
-    out = recv_proc.stdout.read()
-    print '  receiver final:', out.strip()
-    # print sender diagnostics (connect errors etc.)
-    try:
-        snd_out.close()
-        snd_txt = open('/tmp/mptcp_send_i.out').read().strip()
-        if snd_txt:
-            print '  sender log:', snd_txt[:400]
-    except Exception:
-        pass
+    for demo in demos:
+        try:
+            out = recv_procs[demo.fid].stdout.read()
+            print '  flow %d receiver final: %s' % (demo.fid, out.strip())
+        except Exception:
+            pass
+        try:
+            fi = demos.index(demo)
+            snd_outs[demo.fid].close()
+            snd_txt = open('/tmp/mptcp_send_%d.out' % fi).read().strip()
+            if snd_txt:
+                print '  flow %d sender log: %s' % (demo.fid, snd_txt[:300])
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
