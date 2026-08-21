@@ -497,6 +497,7 @@ class MptcpGroupSender(object):
             try:
                 with open('/tmp/mptcp_sender_%d.json' % self.flow_id, 'w') as _f:
                     _json.dump({
+                        'flow_id': self.flow_id,
                         'dsn_next': self.max_dsn,
                         'state': state,
                         'ecn': sw_ecn,

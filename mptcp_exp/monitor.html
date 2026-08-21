@@ -2,10 +2,12 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>MPTCP DSN/SSN 实时监控</title>
+<title>MPTCP 实时监控</title>
 <style>
   body { font-family: 'Microsoft YaHei', sans-serif; background:#0f172a; color:#e2e8f0; margin:20px; }
   h1 { font-size:20px; color:#38bdf8; }
+  .legend { font-size:12px; color:#94a3b8; margin:4px 0 14px; line-height:1.6; }
+  .legend b { color:#e2e8f0; }
   .card { background:#1e293b; border:1px solid #334155; border-radius:8px; padding:14px; margin:12px 0; }
   .flow-title { font-size:15px; font-weight:bold; margin-bottom:8px; }
   .meta { font-size:12px; color:#94a3b8; margin:2px 0; }
@@ -14,14 +16,31 @@
   th { background:#0f172a; color:#38bdf8; }
   .bar-wrap { background:#0f172a; border-radius:4px; height:14px; width:120px; display:inline-block; overflow:hidden; vertical-align:middle; }
   .bar { height:100%; background:#22c55e; display:block; }
-  .state0 { color:#22c55e; font-weight:bold; } .state1 { color:#eab308; font-weight:bold; } .state2 { color:#ef4444; font-weight:bold; }
+  .st0 { color:#22c55e; font-weight:bold; } .st1 { color:#eab308; font-weight:bold; } .st2 { color:#ef4444; font-weight:bold; }
   .recv { color:#38bdf8; }
 </style>
 </head>
 <body>
-<h1>MPTCP DSN/SSN 二维实时监控</h1>
+<h1>MPTCP 多路径实时监控</h1>
+<div class="legend">
+  <b>怎么看:</b> 一条「连接」用 3~4 条「子流」并行传数据;每子流有自己的路径、发送/接收计数、在途段数、
+  拥塞窗口(cwnd)与信用额度。RL 调度器每 200ms 看全网(交换机 ECN + 各子流在途)来调 cwnd 和选路。
+  <b>颜色:</b> 拥塞状态 0=空闲(green) 1=繁忙(黄) 2=拥塞(红)。子流路径:直连 / WiFi / 蜂窝 / 光纤。
+</div>
 <div id="app">加载中…</div>
 <script>
+function pathName(p) {
+  return {direct:'直连', sw1:'WiFi', sw2:'蜂窝', sw3:'光纤'}[p] || p;
+}
+function stateName(s) {
+  return {0:'空闲', 1:'繁忙', 2:'拥塞'}[s] || s;
+}
+function ecnStr(e) {
+  if (!e) return '—';
+  var parts = [];
+  for (var k in e) parts.push('sw' + k + '=' + Number(e[k]).toFixed(2));
+  return parts.join(' · ');
+}
 function bar(v, max) {
   var pct = max > 0 ? Math.min(100, v / max * 100) : 0;
   return '<span class="bar-wrap"><span class="bar" style="width:' + pct + '%"></span></span> ' + v;
@@ -31,35 +50,36 @@ async function refresh() {
     var r = await fetch('build/monitor_state.json');
     var st = await r.json();
     var html = '';
-    for (var i = 0; i < (st.flows || []).length; i++) {
-      var f = st.flows[i];
-      html += '<div class="card"><div class="flow-title">Flow '
-        + (f.flow_id !== undefined ? f.flow_id : '?')
-        + ' — RL state <span class="state' + (f.state || 0) + '">' + (f.state || 0) + '</span>'
-        + ' · 发送端 DSN=' + (f.dsn_next || 0)
-        + ' · 交换机 ECN=' + JSON.stringify(f.ecn || {}) + '</div>';
-      html += '<table><tr><th>子流</th><th>路径</th><th>SSN(已发)</th><th>接收</th>'
-        + '<th>在途</th><th>cwnd</th><th>credit 上限</th></tr>';
+    var flows = st.flows || [];
+    if (flows.length === 0) html = '<div class="meta">暂无连接数据(请先运行 run_mptcp.py 并等待进入发送阶段)</div>';
+    for (var i = 0; i < flows.length; i++) {
+      var f = flows[i];
+      html += '<div class="card"><div class="flow-title">连接 #'
+        + (f.flow_id !== undefined ? f.flow_id : '—')
+        + ' · 拥塞状态 <span class="st' + (f.state || 0) + '">' + stateName(f.state) + '</span>'
+        + ' · 已发送到 DSN=' + (f.dsn_next || 0)
+        + '<div class="meta">交换机 ECN(越高越拥塞): ' + ecnStr(f.ecn) + '</div></div>';
+      html += '<table><tr><th>子流</th><th>路径</th><th>已发段数</th><th>接收端收到</th>'
+        + '<th>在途(未确认)</th><th>拥塞窗口 cwnd</th><th>信用上限</th></tr>';
       var sub = f.subflows || {};
       for (var sid in sub) {
         var s = sub[sid];
-        html += '<tr><td>' + sid + '</td><td>' + s.path + '</td>'
+        html += '<tr><td>#' + sid + '</td><td>' + pathName(s.path) + '</td>'
           + '<td>' + s.send + '</td><td>' + s.recv + '</td>'
           + '<td>' + s.inflight + '</td>'
           + '<td>' + bar(s.cwnd, Math.max(s.cwnd, 1)) + '</td>'
           + '<td>' + s.credit + '</td></tr>';
       }
-      html += '</table></div>';
+      html += '</table><div class="meta">在途 = 已发但接收端还没按序确认的段;发送受「在途 &lt; min(cwnd, 信用上限)」约束。</div></div>';
     }
     var recv = st.recv || {};
-    html += '<div class="card"><div class="flow-title recv">接收端 DSN 重组</div>'
-      + '<div class="meta">已按序交付 ordered=' + (recv.ordered || 0)
-      + ' · 下一个期望 next_dsn=' + (recv.next_dsn || 0)
-      + ' · 乱序缓冲 in_buf=' + (recv.in_buf || 0) + '</div>'
-      + '<div class="meta">各子流累计接收 per_sub=' + JSON.stringify(recv.per_sub || {}) + '</div></div>';
+    html += '<div class="card"><div class="flow-title recv">接收端汇总</div>'
+      + '<div class="meta">已按序交付 <b>' + (recv.ordered || 0) + '</b> 段 · 乱序缓冲待排 <b>' + (recv.in_buf || 0) + '</b> 段'
+      + (recv.in_buf ? ' (为 0 表示数据全部按序到达)' : ' (完美:没有堆积)') + '</div>'
+      + '<div class="meta">各子流接收分布: ' + JSON.stringify(recv.per_sub || {}) + '</div></div>';
     document.getElementById('app').innerHTML = html;
   } catch (e) {
-    document.getElementById('app').innerHTML = '等待实验数据… (start run_mptcp.py, then refresh)';
+    document.getElementById('app').innerHTML = '<div class="meta">等待实验数据…(启动 run_mptcp.py 后自动出现)</div>';
   }
 }
 refresh();
