@@ -542,6 +542,7 @@ class MptcpGroupSender(object):
                         'ecn': sw_ecn,
                         'subflows': {sf.sid_int: {
                             'path': sf.path, 'send': sf.send_count,
+                            'ssn': sf.send_count,     # app-layer SSN (DSS axis)
                             'recv': sf.recv_count, 'cwnd': sf.cwnd,
                             'inflight': sf.in_flight,
                             'credit': sf.credit_limit,
@@ -567,17 +568,29 @@ class MptcpGroupSender(object):
         # coarse state for the monitor (based on gap size)
         return 2 if maxd - nxt > 8 else (1 if maxd - nxt > 2 else 0)
 
-    def run_loop(self, stop_file=None, settle=3.0):
+    def run_loop(self, stop_file=None, settle=3.0, cmd_file=None):
         """Main send loop with graceful shutdown: keep sending until stop_file
         appears (or KeyboardInterrupt); then stop assigning new DSNs, let the
         NAK thread + active tail recovery fill the remaining gap, and close
         the subflows (FIN) so the receiver drains a complete ordered stream.
-        (Replaces a hard SIGTERM kill, which truncated the tail -> in_buf.)"""
+        (Replaces a hard SIGTERM kill, which truncated the tail -> in_buf.)
+        If cmd_file is given, it is a control channel for dynamic subflow
+        management (MPTCP ADD_ADDR / REMOVE_ADDR simulation): lines like
+        'add <sid> <dst_ip> <path>' or 'remove <sid>' are executed."""
         dsn = 0
         try:
             while True:
                 if stop_file and os.path.exists(stop_file):
                     break
+                if cmd_file and os.path.exists(cmd_file):
+                    try:
+                        with open(cmd_file) as _f:
+                            lines = _f.read().strip().splitlines()
+                        os.remove(cmd_file)
+                        for line in lines:
+                            self._exec_cmd(line)
+                    except Exception:
+                        pass
                 self.send_next(dsn)
                 dsn += 1
                 time.sleep(0.01)
@@ -600,6 +613,45 @@ class MptcpGroupSender(object):
                 pass
         print '  [sender] gracefully closed after %d DSNs (recv next=%d)' % (
             dsn, self._recv_next)
+
+    def _exec_cmd(self, line):
+        """Execute one control command: 'add <sid> <dst_ip> <path>' or
+        'remove <sid>' -- dynamic subflow management (ADD_ADDR/REMOVE_ADDR)."""
+        parts = line.split()
+        if not parts:
+            return
+        if parts[0] == 'add' and len(parts) >= 4:
+            self.add_subflow(parts[2], int(parts[1]), parts[3])
+        elif parts[0] == 'remove' and len(parts) >= 2:
+            self.remove_subflow(int(parts[1]))
+
+    def add_subflow(self, dst_ip, sid, path):
+        """Dynamically add a subflow (MPTCP ADD_ADDR simulation). Returns the
+        new subflow or None on connect failure. The RlScheduler sees it next
+        round (subflows list is shared)."""
+        s = self._connect(dst_ip, sid, path)
+        if s is None:
+            print '  [sender] add subflow %d (%s) connect failed' % (sid, path)
+            return None
+        with self._lock:
+            self.senders.append(s)
+        print '  [sender] ADD_ADDR: subflow %d (%s) added' % (sid, path)
+        return s
+
+    def remove_subflow(self, sid):
+        """Gracefully remove a subflow (MPTCP REMOVE_ADDR simulation)."""
+        with self._lock:
+            s = next((x for x in self.senders if x.sid_int == sid), None)
+            if s is None:
+                print '  [sender] remove subflow %d: not live' % sid
+                return False
+            self.senders.remove(s)
+        try:
+            s.close()
+        except Exception:
+            pass
+        print '  [sender] REMOVE_ADDR: subflow %d (%s) removed' % (sid, s.path)
+        return True
 
     def _retransmit_remaining(self):
         """Retransmit the gap [recv_next, max_dsn) on healthy subflows during
