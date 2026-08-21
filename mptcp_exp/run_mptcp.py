@@ -104,6 +104,59 @@ def run_cli(cmds, thrift_port=9090):
     return out, err
 
 
+def ecn_collector():
+    """Periodically read each switch's ecn_marks register and write the SDN
+    global view to /tmp/ecn_global.json (shared; RL-driven senders read it
+    every scheduling round to do DCQCN + RL state)."""
+    import json as _json
+    while True:
+        try:
+            ecn = {}
+            for s in range(1, N_SW + 1):
+                out, _ = run_cli('register_read ecn_marks 0\n',
+                                 thrift_port=SW_PORT[s - 1])
+                v = 0.0
+                for line in out.splitlines():
+                    if '=' in line:
+                        try:
+                            v = min(1.0, float(line.split('=')[-1].strip()) / 200.0)
+                            break
+                        except ValueError:
+                            continue
+                ecn[s] = v
+            with open('/tmp/ecn_global.json', 'w') as f:
+                _json.dump(ecn, f)
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+def monitor_collector():
+    """Aggregate the sender/receiver live state files into
+    build/monitor_state.json for the DSN/SSN monitor page."""
+    import json as _json
+    import glob
+    while True:
+        try:
+            state = {'flows': [], 'recv': {}}
+            for f in glob.glob('/tmp/mptcp_sender_*.json'):
+                try:
+                    with open(f) as fh:
+                        state['flows'].append(_json.load(fh))
+                except Exception:
+                    pass
+            try:
+                with open('/tmp/mptcp_recv_live.json') as fh:
+                    state['recv'] = _json.load(fh)
+            except Exception:
+                pass
+            with open(os.path.join(_HERE, 'build', 'monitor_state.json'), 'w') as fh:
+                _json.dump(state, fh)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
 # ---- direct-link construction ----
 # Each direct subflow of (src,dst) gets a unique /30: 10.1.<idx>.1 (src),
 # 10.1.<idx>.2 (dst). Interface names: hN-d<idx>.
@@ -251,6 +304,15 @@ def main():
             logf.close()
             sys.exit(1)
     print '  switches running on thrift:', SW_PORT
+
+    # start the SDN ECN collector (writes /tmp/ecn_global.json for RL senders)
+    import threading
+    _ecn_thr = threading.Thread(target=ecn_collector)
+    _ecn_thr.daemon = True
+    _ecn_thr.start()
+    _mon_thr = threading.Thread(target=monitor_collector)
+    _mon_thr.daemon = True
+    _mon_thr.start()
 
     # ---- 7. Push LPM routes to each switch ----
     print '\n=== 7. Push LPM routes (per switch) ==='
@@ -674,11 +736,11 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
         else:
             sw_idx = int(sf.path[2]) - 1
             ipb = sw_ip(demo.dst, sw_idx + 1)
-        send_dest.append((ipb, k))
+        send_dest.append((ipb, k, sf.path))
     snd_body = (
         'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
         'import mptcp_tcp, time\n'
-        'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d)\n'
+        'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r)\n'
         'dsn = 0\n'
         'try:\n'
         '    while True:\n'
@@ -687,7 +749,7 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
         '        time.sleep(0.01)\n'
         'except KeyboardInterrupt:\n'
         '    pass\n'
-    ) % (demo.fid, [(ipb, k) for ipb, k in send_dest], port)
+    ) % (demo.fid, [(ipb, k, path) for ipb, k, path in send_dest], port, POLICY_REAL)
     with open('/tmp/mptcp_send_i.py', 'w') as f:
         f.write(snd_body)
     snd_out = open('/tmp/mptcp_send_i.out', 'w')

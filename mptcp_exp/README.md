@@ -14,8 +14,8 @@ DCQCN + Credit + RL 三域协同拥塞控制。
 | `run_mptcp.py` | 主脚本:16 命名空间 + 3 台 BMv2(独立子网/thrift/ECN)+ 直连 veth;异构配置;多里程碑演示 + 真实训练 |
 | `tcp_stack.py` | 自定义 TCP:握手/序号/ACK/RTO 重传/cwnd(可被 RL 覆盖)+ 重传路径 |
 | `mptcp_io.py` | DSN/SSN 标记的传输:发送端按 SSN 编号,接收端按 DSN 重组 |
-| `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 |
-| `mptcp_scheduler.py` | 多交换机感知调度:DCQCN(每交换机独立 ECN)+ Credit + RL(路径比例/cwnd/成本) |
+| `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 + **应用层 cwnd/credit 窗口**(RL 设置 cwnd,in_flight < min(cwnd, credit) 才发) |
+| `mptcp_scheduler.py` | 多交换机感知调度:DCQCN(每交换机独立 ECN)+ Credit + RL(路径比例/cwnd/成本);`RlScheduler` 内嵌调度器驱动真实发送 |
 | `rl_train_mptcp.py` | 离线分层 Q-learning(路径比例 profile + cwnd),交替冻结训练;导出 Q 表数值 |
 | `rl_real_train.py` | 真实环境训练:读真实 ECN/丢包/时延做奖励,微调策略;从离线 Q **warm-start**,保存时导出 `policy_path`/`policy_cwnd` 供调度器加载 |
 | `simple_router_global.p4` | 数据面:转发 + ECN 标记 + meter 限速 |
@@ -59,17 +59,20 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 断链重传 | 四层恢复:发送失败即重传 / go-back-N 重放 / NAK(最小缺失 DSN) / 停滞检测(踢出静默卡死子流) | --demo 生命周期:in_buf 0,唯一 DSN 全部按序交付 |
 | 断链重路由 | 交互 cut/up + `--cut`/`--demo` 自动演示;子流 ~2s 自动重连 | --cut sw1:received==ordered, in_buf 0 |
 | RL 策略部署 | 离线存 Q → 真实微调 **warm-start**(不冷启动)→ 保存导出 `policy_path`/`policy_cwnd` → 调度器(RlPathSelector/RlCwndController/MptcpScheduler)加载并驱动决策 | 微调后 policy_cwnd [1,1,1]→[1,0,1](state1 cwnd×2);三调度器加载单测通过 |
+| RL 驱动真实发送 | `MptcpGroupSender` 内嵌 `RlScheduler`:每轮读真实 ECN/credit/in_flight → 决策 cwnd + 路径权重;发送受 `in_flight < min(cwnd, credit)` 窗口约束;三域闭环(DCQCN 读真实 ecn_marks / Credit 接收方授信 / RL 全局) | step 11 实测:cwnd=16→4 时 inflight 跟随封顶(16→4);ECN 高时 state2 cwnd 减半;断链重传不回归 |
+| 监控页 M8 | DSN/SSN 二维实时监控:`build/monitor.html` 实时渲染每流 DSN 进度 + 每子流 SSN/接收/在途/cwnd/credit + 接收端重组 | 浏览器实时刷新,cwnd/inflight 随 RL 决策变化可见 |
 
-## 三域拥塞控制(核心)
+## 三域拥塞控制(真实闭环)
 
 ```
-拥塞域① 交换机(共享):DCQCN — ECN标记 → 经交换机子流统一降速
-拥塞域② 节点汇聚:     Credit(按子流)— 防某子流独占缓冲
-拥塞域③ 直连(点对点):  Credit — 接收方授信,额度内发
-全局:                 RL — 看ECN+credit+成本,做比例分流/cwnd/路径
+拥塞域① 交换机(共享):DCQCN — 主进程周期读真实 ecn_marks → 写入 ECN 全局视图
+                       → 发送器内 RlScheduler 对高 ECN 交换机子流 cwnd 减半
+拥塞域② 节点汇聚:     Credit — 每子流在途受 credit_limit(接收方授信上限)约束
+拥塞域③ 直连(点对点):  Credit — 直连子流同样受窗口约束
+全局:                 RL(RlScheduler)— 看真实 ECN + 各子流 in_flight/credit,
+                     下发改动的 cwnd + 路径权重,真实控制每条子流发送速率
 ```
 
 ## 待办
 
-- M8:DSN/SSN 二维实时监控页
 - 重传优化:发送器优雅结束(消除尾部截断);SACK 位图精确报缺(dup → ~0)

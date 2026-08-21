@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MPTCP DSN/SSN 实时监控</title>
+<style>
+  body { font-family: 'Microsoft YaHei', sans-serif; background:#0f172a; color:#e2e8f0; margin:20px; }
+  h1 { font-size:20px; color:#38bdf8; }
+  .card { background:#1e293b; border:1px solid #334155; border-radius:8px; padding:14px; margin:12px 0; }
+  .flow-title { font-size:15px; font-weight:bold; margin-bottom:8px; }
+  .meta { font-size:12px; color:#94a3b8; margin:2px 0; }
+  table { border-collapse:collapse; width:100%; margin-top:8px; font-size:13px; }
+  th, td { border:1px solid #334155; padding:5px 8px; text-align:center; }
+  th { background:#0f172a; color:#38bdf8; }
+  .bar-wrap { background:#0f172a; border-radius:4px; height:14px; width:120px; display:inline-block; overflow:hidden; vertical-align:middle; }
+  .bar { height:100%; background:#22c55e; display:block; }
+  .state0 { color:#22c55e; font-weight:bold; } .state1 { color:#eab308; font-weight:bold; } .state2 { color:#ef4444; font-weight:bold; }
+  .recv { color:#38bdf8; }
+</style>
+</head>
+<body>
+<h1>MPTCP DSN/SSN 二维实时监控</h1>
+<div id="app">加载中…</div>
+<script>
+function bar(v, max) {
+  var pct = max > 0 ? Math.min(100, v / max * 100) : 0;
+  return '<span class="bar-wrap"><span class="bar" style="width:' + pct + '%"></span></span> ' + v;
+}
+async function refresh() {
+  try {
+    var r = await fetch('build/monitor_state.json');
+    var st = await r.json();
+    var html = '';
+    for (var i = 0; i < (st.flows || []).length; i++) {
+      var f = st.flows[i];
+      html += '<div class="card"><div class="flow-title">Flow '
+        + (f.flow_id !== undefined ? f.flow_id : '?')
+        + ' — RL state <span class="state' + (f.state || 0) + '">' + (f.state || 0) + '</span>'
+        + ' · 发送端 DSN=' + (f.dsn_next || 0)
+        + ' · 交换机 ECN=' + JSON.stringify(f.ecn || {}) + '</div>';
+      html += '<table><tr><th>子流</th><th>路径</th><th>SSN(已发)</th><th>接收</th>'
+        + '<th>在途</th><th>cwnd</th><th>credit 上限</th></tr>';
+      var sub = f.subflows || {};
+      for (var sid in sub) {
+        var s = sub[sid];
+        html += '<tr><td>' + sid + '</td><td>' + s.path + '</td>'
+          + '<td>' + s.send + '</td><td>' + s.recv + '</td>'
+          + '<td>' + s.inflight + '</td>'
+          + '<td>' + bar(s.cwnd, Math.max(s.cwnd, 1)) + '</td>'
+          + '<td>' + s.credit + '</td></tr>';
+      }
+      html += '</table></div>';
+    }
+    var recv = st.recv || {};
+    html += '<div class="card"><div class="flow-title recv">接收端 DSN 重组</div>'
+      + '<div class="meta">已按序交付 ordered=' + (recv.ordered || 0)
+      + ' · 下一个期望 next_dsn=' + (recv.next_dsn || 0)
+      + ' · 乱序缓冲 in_buf=' + (recv.in_buf || 0) + '</div>'
+      + '<div class="meta">各子流累计接收 per_sub=' + JSON.stringify(recv.per_sub || {}) + '</div></div>';
+    document.getElementById('app').innerHTML = html;
+  } catch (e) {
+    document.getElementById('app').innerHTML = '等待实验数据… (start run_mptcp.py, then refresh)';
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

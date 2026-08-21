@@ -307,3 +307,71 @@ class RlPathSelector(object):
             if s in self.sw_ecn:
                 self.sw_ecn[s] = v
         self.ecn_ratio = max(self.sw_ecn.values()) if self.sw_ecn else 0.0
+
+
+class RlScheduler(object):
+    """Embedded SDN-global scheduler for a real sender (MptcpGroupSender).
+
+    Every step it reads the global state (per-switch ECN + per-subflow
+    in-flight) and produces, from the fine-tuned policy:
+      - per-subflow cwnd (RL low level; DCQCN cut on high-ECN switch paths)
+      - per-subflow path weights (RL high level, inverse of pressure)
+    It reuses RlCwndController (policy loading / congestion state / cwnd
+    action) and RlPathSelector (path pressure / weights), so decisions match
+    the training code exactly. The subflow objects it drives only need
+    sid / sid_int / path / in_flight / _effective_cwnd.
+    """
+
+    BASE_CWND = 16
+    MIN_CWND = 4
+    MAX_CWND = 128
+    DCQCN_CUT = 0.5                 # switch-subflow cwnd cut when ECN high
+    DCQCN_HIGH = 0.4
+
+    def __init__(self, subflows, policy_path=None, base_cwnd=BASE_CWND, n_sw=3):
+        self.subflows = subflows
+        self.base_cwnd = base_cwnd
+        # cwnd controller (loads policy_cwnd / actions_cwnd) + path selector
+        # (loads policy_path / actions_path); no real Flow needed -- a tiny
+        # stand-in holding the live subflow sockets is enough.
+        self._flow = type('_Flow', (), {'subflows': subflows})()
+        self.ctrl = RlCwndController([self._flow], policy_path=policy_path)
+        self.sel = RlPathSelector([self._flow], policy_path=policy_path, n_sw=n_sw)
+        for sf in subflows:
+            self.sel.sockets[sf.sid] = sf
+        self.sw_ecn = {s: 0.0 for s in range(1, n_sw + 1)}
+        self.cwnd = {sf.sid: base_cwnd for sf in subflows}
+        self.last_state = 0
+
+    def congestion_state(self, ecn_agg, avg_occ):
+        return self.ctrl.congestion_state(ecn_agg, avg_occ)
+
+    def step(self, sw_ecn, per_sub):
+        """One scheduling round. sw_ecn: {sw_idx: ratio}; per_sub: {sid_int: cnt}.
+        Returns (state, {sid: cwnd}, {sid: weight})."""
+        for sf in self.subflows:            # re-bind (reconnect swaps sockets)
+            self.sel.sockets[sf.sid] = sf
+        self.sel.observe(sw_ecn)
+        self.sw_ecn.update(sw_ecn)
+        for sf in self.subflows:
+            sf.recv_count = per_sub.get(sf.sid_int, sf.recv_count)
+        ecn_agg = max(self.sw_ecn.values()) if self.sw_ecn else 0.0
+        occs = [float(sf.in_flight) / max(sf._effective_cwnd(), 1)
+                for sf in self.subflows]
+        avg_occ = sum(occs) / max(len(occs), 1)
+        state = self.congestion_state(ecn_agg, avg_occ)
+        self.last_state = state
+        mul = self.ctrl.cwnd_action_for(state)      # policy cwnd multiplier
+        for sf in self.subflows:
+            cw = max(self.MIN_CWND, min(self.MAX_CWND, self.base_cwnd * mul))
+            if sf.path.startswith('sw'):
+                s_idx = int(sf.path[2])             # 'sw1' -> 1
+                if self.sw_ecn.get(s_idx, 0.0) >= self.DCQCN_HIGH:
+                    cw = max(self.MIN_CWND, cw * self.DCQCN_CUT)
+            sf.cwnd = cw
+            self.cwnd[sf.sid] = cw
+        weights = self.sel.path_weights(self._flow)
+        return state, dict(self.cwnd), weights
+
+    def path_weights(self):
+        return self.sel.path_weights(self._flow)

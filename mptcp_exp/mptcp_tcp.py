@@ -18,6 +18,7 @@ TCP connection and we emulate the MPTCP data-plane (DSN mapping/reorder) in
 the application, which is the paper's focus.
 """
 
+import json
 import select
 import socket
 import struct
@@ -135,6 +136,18 @@ class TcpDsnReceiver(object):
                     s.close()
                     continue
                 pair[1] = self._drain(pair[1] + data)
+            self._ticks = getattr(self, '_ticks', 0) + 1
+            if self._ticks % 100 == 0:
+                with self._ctl_lock:
+                    _st = {'next_dsn': self.next_dsn,
+                           'per_sub': dict(self.per_sub),
+                           'in_buf': len(self.buf),
+                           'ordered': len(self.ordered)}
+                try:
+                    with open('/tmp/mptcp_recv_live.json', 'w') as _f:
+                        json.dump(_st, _f)
+                except Exception:
+                    pass
             time.sleep(0.01)
         for pair in conns:
             pair[0].close()
@@ -151,11 +164,13 @@ class TcpDsnReceiver(object):
                 break               # header/payload incomplete -> wait for more
             fid, sid, dsn, payload = seg
             self.received += 1
-            self.per_sub[sid] = self.per_sub.get(sid, 0) + 1
             if dsn in self.seen:
                 self.dup += 1          # retransmission arrived after delivery
             else:
                 self.seen.add(dsn)
+                # count ONLY first-time DSNs per subflow so the sender's
+                # recv_count -> in_flight is accurate (not inflated by retrans)
+                self.per_sub[sid] = self.per_sub.get(sid, 0) + 1
                 self.buf[dsn] = payload
                 with self._ctl_lock:
                     while self.next_dsn in self.buf:
@@ -174,16 +189,39 @@ class TcpDsnReceiver(object):
 
 
 class TcpSsnSender(object):
-    """Sends one DSN-tagged segment over a REAL kernel TCP connection."""
+    """One subflow socket plus its app-layer window state (SSN/credit axis):
+    send/recv counts, RL-set cwnd, receiver-granted credit cap. The RL
+    scheduler and the sender's window check drive these fields."""
 
-    def __init__(self, dst_ip, port, subflow_id, sid_int=0):
+    def __init__(self, dst_ip, port, subflow_id, sid_int=0, path='direct'):
         self.dst_ip = dst_ip
         self.port = port
+        self.sid = subflow_id
+        self.sid_int = sid_int
+        self.path = path
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(3)
         self.sock.connect((dst_ip, port))
-        self.sid = subflow_id
-        self.sid_int = sid_int
+        # app-layer window state (SSN/credit axis)
+        self.send_count = 0        # new DSNs sent on this subflow (stats)
+        self.recv_count = 0        # receiver-reported received count (stats)
+        self.cwnd = 16             # RL-set in-flight cap
+        self.credit_limit = 20     # receiver-granted in-flight cap (ssn_credit_grant)
+        self.assigned = []         # DSNs assigned here not yet ordered by recv
+        self.recent = []           # recent DSNs for go-back-N replay
+
+    @property
+    def in_flight(self):
+        # number of DSNs assigned to this subflow that the receiver has not
+        # yet ordered (next_dsn >= dsn); retransmission crosses subflows, so
+        # counting via assigned-DSNs is accurate (not per-subflow recv count)
+        return len(self.assigned)
+
+    def _effective_cwnd(self):
+        return max(1, int(self.cwnd))
+
+    def can_send(self):
+        return self.in_flight < min(self._effective_cwnd(), self.credit_limit)
 
     def send_seg(self, flow_id, dsn, payload=b'Q' * 100):
         self.sock.sendall(pack_seg(flow_id, self.sid_int, dsn, payload))
@@ -213,32 +251,38 @@ class MptcpGroupSender(object):
     NAK_POLL = 0.7               # seconds between NAK polls
     NAK_PACE = 0.003             # seconds between retransmitted DSNs
 
-    def __init__(self, flow_id, dests, port, retry_interval=2.0, control_port=None):
-        # dests: list of (dst_ip, sid_int)
+    def __init__(self, flow_id, dests, port, retry_interval=2.0, control_port=None,
+                 policy_path=None):
+        # dests: list of (dst_ip, sid_int, path)
         self.flow_id = flow_id
         self.port = port
         self.control_port = control_port or port
         self.senders = []              # live subflow sockets
-        self.dead = []                 # (dst_ip, sid_int) awaiting reconnect
+        self.dead = []                 # (dst_ip, sid_int, path) awaiting reconnect
         self.retry_interval = retry_interval
         self.max_dsn = 0               # highest DSN assigned so far
         self._last_retry = time.time()
         self._lock = threading.Lock()
-        for ipb, sid in dests:
-            s = self._connect(ipb, sid)
+        self._recv_counts = {}         # sid_int -> receiver received count
+        self._rl_counter = 0
+        self._rl_state = 0
+        for ipb, sid, path in dests:
+            s = self._connect(ipb, sid, path)
             if s is None:
                 print '  [sender] subflow %d connect failed' % sid
-                self.dead.append((ipb, sid))
+                self.dead.append((ipb, sid, path))
             else:
                 self.senders.append(s)
+        import mptcp_scheduler as sch
+        self.scheduler = sch.RlScheduler(self.senders, policy_path=policy_path)
         ctl = threading.Thread(target=self._nak_loop)
         ctl.daemon = True
         ctl.start()
 
-    def _connect(self, ipb, sid):
+    def _connect(self, ipb, sid, path='direct'):
         try:
             return TcpSsnSender(ipb, self.port, '%d.%d' % (self.flow_id, sid),
-                                sid_int=sid)
+                                sid_int=sid, path=path)
         except Exception:
             return None
 
@@ -269,7 +313,7 @@ class MptcpGroupSender(object):
             time.sleep(self.NAK_POLL)
             with self._lock:
                 ips = ([s.dst_ip for s in self.senders]
-                       + [ipb for ipb, _ in self.dead])
+                       + [d[0] for d in self.dead])
                 maxd = self.max_dsn
             if not ips:
                 continue
@@ -286,6 +330,15 @@ class MptcpGroupSender(object):
                         off += 6
                 except Exception:
                     continue
+                with self._lock:
+                    self._recv_counts = dict(rcv)
+                    # keep recv_count for stats; prune the subflow's assigned
+                    # DSNs once the receiver has ordered them (nxt = next_dsn),
+                    # so in_flight stays accurate while window-throttled.
+                    for s in self.senders:
+                        s.recv_count = rcv.get(s.sid_int, s.recv_count)
+                        if s.assigned:
+                            s.assigned = [d for d in s.assigned if d >= nxt]
                 self._check_stalls(rcv)
                 if nxt < maxd:
                     self._retransmit_range(nxt, maxd)
@@ -293,13 +346,18 @@ class MptcpGroupSender(object):
 
     def _check_stalls(self, rcv):
         """Drop live subflows that delivered nothing new since the last poll
-        (their DSNs are being silently swallowed by a dead connection)."""
+        while the sender is STILL feeding them (their DSNs are being silently
+        swallowed by a dead connection). A subflow with no in-flight data is
+        just window-throttled by RL/cwnd -- it must NOT be flagged."""
         with self._lock:
             live = list(self.senders)
         for s in live:
             sid = s.sid_int
             cnt = rcv.get(sid, 0)
             prev = self._last_rcv.get(sid, cnt)
+            if s.in_flight <= 0:                 # not being fed right now
+                self._stall_rounds[sid] = 0
+                continue
             if cnt > prev:
                 self._stall_rounds[sid] = 0
             else:
@@ -344,7 +402,7 @@ class MptcpGroupSender(object):
         with self._lock:
             if s in self.senders:
                 self.senders.remove(s)
-            self.dead.append((s.dst_ip, s.sid_int))
+            self.dead.append((s.dst_ip, s.sid_int, s.path))
         recent = list(getattr(s, 'recent', []))
         try:
             s.close()
@@ -370,31 +428,89 @@ class MptcpGroupSender(object):
             if time.time() - self._last_retry < self.retry_interval:
                 return
             self._last_retry = time.time()
-            ipb, sid = self.dead.pop(0)
-        s = self._connect(ipb, sid)
+            ipb, sid, path = self.dead.pop(0)
+        s = self._connect(ipb, sid, path)
         if s is not None:
             with self._lock:
                 self.senders.append(s)
             print '  [sender] subflow %d reconnected' % sid
         else:
             with self._lock:
-                self.dead.append((ipb, sid))
+                self.dead.append((ipb, sid, path))
 
     def send_next(self, dsn):
-        """Assign dsn to a live subflow; if that send fails, retransmit it on
-        another healthy subflow. Returns True if a subflow accepted it."""
+        """Assign dsn to a live subflow chosen by the RL scheduler; the send
+        is gated by the subflow's window (in_flight < min(cwnd, credit)). If
+        the chosen subflow fails, retransmit on a healthy one. Returns True
+        if a subflow accepted it."""
         self._try_reconnect()
+        self._rl_counter += 1
+        if self._rl_counter % 20 == 0:
+            self._rl_step()
         with self._lock:
             if not self.senders:
                 return False
-            s = self.senders[dsn % len(self.senders)]
+            live = list(self.senders)
+        s = self._pick_subflow(live)
+        if s is None:
+            return False                    # windows full -> wait next round
         self.max_dsn = dsn + 1
         try:
             self._send_on(s, dsn)
+            s.send_count += 1
+            s.assigned.append(dsn)
             return True
         except Exception:
             self._drop(s)
             return self._retransmit(dsn)
+
+    def _pick_subflow(self, live):
+        """Prefer the RL-preferred (lowest pressure) subflow, skipping any
+        whose window is full (cwnd or receiver-credit cap)."""
+        weights = self.scheduler.path_weights()
+        for sf in sorted(live, key=lambda sf: -weights.get(sf.sid, 0.0)):
+            if sf.can_send():
+                return sf
+        return None
+
+    def _rl_step(self):
+        """One RL scheduling round: read global ECN (written by the main
+        process), refresh cwnd / path weights via RlScheduler, and export the
+        sender state for the DSN/SSN monitor page."""
+        try:
+            import json as _json
+            sw_ecn = {}
+            try:
+                with open('/tmp/ecn_global.json') as _f:
+                    for k, v in _json.load(_f).items():
+                        sw_ecn[int(k)] = float(v)
+            except Exception:
+                pass
+            with self._lock:
+                per_sub = dict(self._recv_counts)
+            state, cwnds, _ = self.scheduler.step(sw_ecn, per_sub)
+            self._rl_state = state
+            print '  [rl] state=%d cwnd=%s' % (
+                state, {k: int(v) for k, v in cwnds.items()})
+            with self._lock:
+                live = list(self.senders)
+            try:
+                with open('/tmp/mptcp_sender_%d.json' % self.flow_id, 'w') as _f:
+                    _json.dump({
+                        'dsn_next': self.max_dsn,
+                        'state': state,
+                        'ecn': sw_ecn,
+                        'subflows': {sf.sid_int: {
+                            'path': sf.path, 'send': sf.send_count,
+                            'recv': sf.recv_count, 'cwnd': sf.cwnd,
+                            'inflight': sf.in_flight,
+                            'credit': sf.credit_limit,
+                        } for sf in live},
+                    }, _f)
+            except Exception:
+                pass
+        except Exception as e:
+            print '  [rl] step failed: %s' % e
 
 
 def demo_send_recv(dst_ip, port, n_subflows, n_seg, sleep=0.01):
