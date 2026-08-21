@@ -527,13 +527,11 @@ def main():
 
         def _real_traffic(weights, cwnd_mul):
             """Send a modest burst over the live topology using the given
-            per-subflow weights; return (received, sent, avg_delay_ms)."""
-            n = 15                              # segments per round (slow)
-            total_sent = 0
-            total_recv = 0
-            delays = []
-            # one listener per receiver namespace on the demo flow
-            demo_flow = flows[0]
+            per-subflow weights; return (received, sent, avg_delay_ms).
+            Batches per source namespace into ONE subprocess (it used to spawn
+            one subprocess PER PACKET -- that process-spawn was the training
+            bottleneck and made each RL round take tens of seconds)."""
+            n = 15                              # segments per round
             port = 7500
             listeners = []
             for f in flows[:4]:
@@ -541,10 +539,10 @@ def main():
                 port += 1
             time.sleep(0.5)
             import random as _rnd
+            per_src = {}
+            sent_by_path = {}
             for _ in range(n):
                 for fi, f in enumerate(flows[:4]):
-                    # pick a subflow by weight
-                    sids = [sf.sid for sf in f.subflows]
                     ws = [weights.get(sf.sid, 0) for sf in f.subflows]
                     tot = sum(ws) or 1.0
                     r = _rnd.random() * tot
@@ -555,37 +553,38 @@ def main():
                         if r <= acc:
                             chosen = sf
                             break
-                    # send one packet over the chosen path
                     if chosen.path == 'direct':
                         dlink = direct_links[chosen.sid]
                         ipb = dlink[3].split('/')[0]
                     else:
                         s_idx = int(chosen.path[2]) - 1
                         ipb = sw_ip(f.dst, s_idx + 1)
-                    t0 = time.time()
-                    # send one small UDP packet from the source namespace to
-                    # the chosen path's dest address (written to a temp
-                    # script to avoid shell nested-quote problems)
-                    snd_py = ('import socket\n'
-                              's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
-                              's.sendto("Q", ("%s", %d))\n' % (ipb, 7500 + fi))
-                    snd_path = os.path.join('/tmp', 'snd_%d.py' % fi)
-                    with open(snd_path, 'w') as _f:
-                        _f.write(snd_py)
-                    sh_quiet('ip netns exec {} python2 {}'.format(
-                        NS(f.src), snd_path))
-                    total_sent += 1
-                    # measure delay of the burst
-                    delays.append((time.time() - t0) * 1000)
-                    time.sleep(0.01)
+                    per_src.setdefault(f.src, []).append((ipb, 7500 + fi))
+                    sent_by_path[chosen.path] = sent_by_path.get(chosen.path, 0) + 1
+            # one batched sender subprocess per source namespace
+            for src, pairs in per_src.items():
+                body = ('import socket, time\n'
+                        's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n')
+                for ipb, p in pairs:
+                    body += 's.sendto("Q", ("%s", %d))\ntime.sleep(0.003)\n' % (ipb, p)
+                path = os.path.join('/tmp', 'snd_src_%d.py' % src)
+                with open(path, 'w') as _f:
+                    _f.write(body)
+                sh_quiet('ip netns exec {} python2 {}'.format(NS(src), path))
+            total_sent = n * len(flows[:4])
             time.sleep(1)
+            total_recv = 0
             for lis in listeners:
                 try:
                     out = lis.stdout.readline()
                     total_recv += int(out.strip())
                 except Exception:
                     pass
-            avg_delay = sum(delays) / max(len(delays), 1)
+            # weighted-average path delay (from the tc profile) for the reward
+            _PD = {'direct': 2, 'sw1': 10, 'sw2': 30, 'sw3': 2}
+            tot = sum(sent_by_path.values()) or 1
+            avg_delay = sum(_PD.get(p, 10) * c / tot
+                            for p, c in sent_by_path.items())
             return total_recv, total_sent, avg_delay
 
         def _read_real_ecn(sw_idx):
