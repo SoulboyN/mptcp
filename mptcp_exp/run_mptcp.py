@@ -630,6 +630,15 @@ def main():
         traceback.print_exc()
         print '  [!] interactive demo skipped:', e
 
+    # ---- 13. CC comparison (T5): RL vs fixed vs pseudo-Reno ----
+    try:
+        demo_flows = [f for f in flows if len(f.subflows) >= 3][:3]
+        compare_cc(demo_flows, pairs, direct_links)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print '  [!] CC comparison skipped:', e
+
     print '\n=== Done (topology up) ==='
     print 'Ctrl-C to cleanup.'
 
@@ -669,6 +678,95 @@ def demo_3domain():
             rnd, ratio, state, m, avg_dir, avg_sw)
         time.sleep(0.3)
     print '  [*] direct subflows keep rate (DCQCN only cuts switch subflows)'
+
+
+def compare_cc(demos, pairs, direct_links, run_seconds=8):
+    """Congestion-control comparison (T5): RL-cwnd vs fixed cwnd vs pseudo-Reno
+    (AIMD) over the same concurrent MPTCP flows; prints per-flow throughput and
+    fairness (Jain's index) for the paper's baseline data."""
+    import mptcp_tcp
+    _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    def sw_ip(i, s):
+        return '{}.{}'.format(_SW_NET[s], i)
+    modes = [('rl', 'RL-cwnd (fine-tuned)'),
+             ('fixed', 'Fixed cwnd=32'),
+             ('aimd', 'Pseudo-Reno (AIMD)')]
+    print '\n=== 13. Congestion-control comparison (T5) ==='
+    results = {}
+    for mi, (mode, label) in enumerate(modes):
+        base_port = 8000 + mi * 10
+        receivers, senders = [], []
+        for fi, demo in enumerate(demos):
+            port = base_port + fi
+            n_sub = len(demo.subflows)
+            recv_body = (
+                'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                'import mptcp_tcp\n'
+                'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=%d)\n'
+                'o = r.recv_loop(%d)\n'
+                'print "OK", r.stats()\n'
+            ) % (port, n_sub, run_seconds + 5, run_seconds + 5)
+            with open('/tmp/cc_recv_%d_%d.py' % (mi, fi), 'w') as f:
+                f.write(recv_body)
+            rp = subprocess.Popen(
+                'ip netns exec {} python2 -u /tmp/cc_recv_%d_%d.py'.format(NS(demo.dst)) % (mi, fi),
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            receivers.append((demo, rp, port))
+            send_dest = []
+            for k, sf in enumerate(demo.subflows):
+                if sf.path == 'direct':
+                    dlink = direct_links[sf.sid]
+                    ipb = dlink[3].split('/')[0]
+                else:
+                    sw_idx = int(sf.path[2]) - 1
+                    ipb = sw_ip(demo.dst, sw_idx + 1)
+                send_dest.append((ipb, k, sf.path))
+            stopf = '/tmp/cc_stop_%d_%d' % (mi, demo.fid)
+            try:
+                os.remove(stopf)
+            except Exception:
+                pass
+            snd_body = (
+                'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                'import mptcp_tcp\n'
+                'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, cc_mode=%r)\n'
+                'g.run_loop(stop_file=%r)\n'
+            ) % (demo.fid, send_dest, port, POLICY_REAL, mode, stopf)
+            with open('/tmp/cc_send_%d_%d.py' % (mi, fi), 'w') as f:
+                f.write(snd_body)
+            sp = subprocess.Popen(
+                'ip netns exec {} python2 -u /tmp/cc_send_%d_%d.py'.format(NS(demo.src)) % (mi, fi),
+                shell=True, preexec_fn=os.setsid,
+                stdout=open('/tmp/cc_send_%d_%d.out' % (mi, fi), 'w'),
+                stderr=subprocess.STDOUT)
+            senders.append((demo, sp, stopf))
+        time.sleep(1)
+        time.sleep(run_seconds)
+        for demo, sp, stopf in senders:
+            try:
+                with open(stopf, 'w'):
+                    pass
+                sp.wait(timeout=6)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+        time.sleep(3)
+        import re as _re
+        thpt = []
+        for demo, rp, port in receivers:
+            out = rp.stdout.read()
+            m = _re.search(r"'ordered': (\d+)", out)
+            ordered = int(m.group(1)) if m else 0
+            thpt.append(ordered / float(run_seconds))
+        n = len(thpt)
+        jain = ((sum(thpt) ** 2) / (n * sum(x * x for x in thpt))) \
+            if n and sum(thpt) else 0.0
+        results[mode] = (thpt, jain)
+        print '  %-24s thpt=%s seg/s  jain=%.3f' % (
+            label, ['%.1f' % t for t in thpt], jain)
+    return results
 
 
 def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):

@@ -263,11 +263,13 @@ class MptcpGroupSender(object):
     NAK_PACE = 0.003             # seconds between retransmitted DSNs
 
     def __init__(self, flow_id, dests, port, retry_interval=2.0, control_port=None,
-                 policy_path=None):
+                 policy_path=None, cc_mode='rl', fixed_cwnd=32):
         # dests: list of (dst_ip, sid_int, path)
         self.flow_id = flow_id
         self.port = port
         self.control_port = control_port or port
+        self.cc_mode = cc_mode              # 'rl' | 'fixed' | 'aimd'
+        self.fixed_cwnd = fixed_cwnd
         self.senders = []              # live subflow sockets
         self.dead = []                 # (dst_ip, sid_int, path) awaiting reconnect
         self.retry_interval = retry_interval
@@ -502,9 +504,10 @@ class MptcpGroupSender(object):
         return None
 
     def _rl_step(self):
-        """One RL scheduling round: read global ECN (written by the main
-        process), refresh cwnd / path weights via RlScheduler, and export the
-        sender state for the DSN/SSN monitor page."""
+        """One scheduling round by the selected CC mode: 'rl' reads global ECN
+        and lets RlScheduler set cwnd/path from the policy; 'fixed' keeps a
+        constant cwnd; 'aimd' does additive-increase / multiplicative-decrease
+        on observed loss (pseudo-Reno). Exports sender state for the monitor."""
         try:
             import json as _json
             sw_ecn = {}
@@ -514,12 +517,20 @@ class MptcpGroupSender(object):
                         sw_ecn[int(k)] = float(v)
             except Exception:
                 pass
-            with self._lock:
-                per_sub = dict(self._recv_counts)
-            state, cwnds, _ = self.scheduler.step(sw_ecn, per_sub)
-            self._rl_state = state
-            print '  [rl] state=%d cwnd=%s' % (
-                state, {k: int(v) for k, v in cwnds.items()})
+            state = 0
+            if self.cc_mode == 'fixed':
+                for sf in list(self.senders):
+                    sf.cwnd = self.fixed_cwnd
+                print '  [cc] fixed cwnd=%d' % self.fixed_cwnd
+            elif self.cc_mode == 'aimd':
+                state = self._cc_aimd_step()
+            else:
+                with self._lock:
+                    per_sub = dict(self._recv_counts)
+                state, cwnds, _ = self.scheduler.step(sw_ecn, per_sub)
+                self._rl_state = state
+                print '  [rl] state=%d cwnd=%s' % (
+                    state, {k: int(v) for k, v in cwnds.items()})
             with self._lock:
                 live = list(self.senders)
             try:
@@ -539,7 +550,22 @@ class MptcpGroupSender(object):
             except Exception:
                 pass
         except Exception as e:
-            print '  [rl] step failed: %s' % e
+            print '  [cc] step failed: %s' % e
+
+    def _cc_aimd_step(self):
+        """Additive-increase / multiplicative-decrease on observed loss
+        (pseudo-Reno): if the receiver reports a gap, halve cwnd; else +1."""
+        with self._lock:
+            nxt = self._recv_next
+            maxd = self.max_dsn
+        for sf in list(self.senders):
+            if maxd - nxt > 8:
+                sf.cwnd = max(4, int(sf.cwnd / 2))
+            else:
+                sf.cwnd = min(64, int(sf.cwnd) + 1)
+        print '  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in self.senders}
+        # coarse state for the monitor (based on gap size)
+        return 2 if maxd - nxt > 8 else (1 if maxd - nxt > 2 else 0)
 
     def run_loop(self, stop_file=None, settle=3.0):
         """Main send loop with graceful shutdown: keep sending until stop_file

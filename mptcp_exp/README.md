@@ -64,6 +64,7 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 优雅结束 | 发送器 stop 文件触发:停发新 DSN → NAK 收尾补缺口 → FIN 关闭(替代强杀截断) | 尾部 in_buf 归 0 |
 | SACK 精确报缺 | receiver 回报 128-bit 缺失 DSN 位图,sender 只重传缺失段 | dup 从几十~几百降到 ~12 |
 | 多流并发演示 | step 11 同时 3 条 MPTCP 连接(各 3~4 子流),RL 全局感知(共享 ECN)经受真实跨流拥塞 | 3 流独立 receiver 统计;切一条不影响其他流 |
+| 对比实验 T5 | `compare_cc`:RL-cwnd vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 实测 RL/固定/Reno 吞吐差异 + jain 指标 |
 
 ## 三域拥塞控制(真实闭环)
 
@@ -78,5 +79,4 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 
 ## 待办
 
-- 对比实验 T5:RL-cwnd vs 固定 cwnd vs 伪 Reno
 - 协议语义补强:DSS 映射显式记录、动态增删子流(模拟 ADD_ADDR)
