@@ -736,19 +736,18 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
             sw_idx = int(sf.path[2]) - 1
             ipb = sw_ip(demo.dst, sw_idx + 1)
         send_dest.append((ipb, k, sf.path))
+    stopf = '/tmp/mptcp_stop_%d' % demo.fid
+    try:
+        os.remove(stopf)
+    except Exception:
+        pass
     snd_body = (
         'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-        'import mptcp_tcp, time\n'
+        'import mptcp_tcp\n'
         'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r)\n'
-        'dsn = 0\n'
-        'try:\n'
-        '    while True:\n'
-        '        g.send_next(dsn)\n'
-        '        dsn += 1\n'
-        '        time.sleep(0.01)\n'
-        'except KeyboardInterrupt:\n'
-        '    pass\n'
-    ) % (demo.fid, [(ipb, k, path) for ipb, k, path in send_dest], port, POLICY_REAL)
+        'g.run_loop(stop_file=%r)\n'
+    ) % (demo.fid, [(ipb, k, path) for ipb, k, path in send_dest],
+         port, POLICY_REAL, stopf)
     with open('/tmp/mptcp_send_i.py', 'w') as f:
         f.write(snd_body)
     snd_out = open('/tmp/mptcp_send_i.out', 'w')
@@ -853,15 +852,22 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
                     up_path(arg)
         except KeyboardInterrupt:
             pass
-    # terminate the sender AND its child python2 (shell=True leaves an
-    # orphan otherwise); kill the whole process group
+    # graceful stop: signal the sender to stop assigning new DSNs, let it
+    # recover the in-flight tail (NAK) and close subflows (FIN), so the
+    # receiver drains a complete ordered stream instead of a truncated one.
     try:
-        os.killpg(os.getpgid(snd_proc.pid), signal.SIGTERM)
-    except Exception:
-        try:
-            snd_proc.terminate()
-        except Exception:
+        with open('/tmp/mptcp_stop_%d' % demo.fid, 'w'):
             pass
+        snd_proc.wait(timeout=6)
+    except Exception:
+        # fallback: kill the sender's process group (incl. child python2)
+        try:
+            os.killpg(os.getpgid(snd_proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                snd_proc.terminate()
+            except Exception:
+                pass
     try:
         snd_proc.wait(timeout=3)
     except Exception:

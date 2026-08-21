@@ -19,6 +19,7 @@ the application, which is the paper's focus.
 """
 
 import json
+import os
 import select
 import socket
 import struct
@@ -83,9 +84,19 @@ class TcpDsnReceiver(object):
                 with self._ctl_lock:
                     nxt = self.next_dsn
                     per_sub = dict(self.per_sub)
+                    buf = self.buf
                 payload = struct.pack('>QH', nxt, len(per_sub))
                 for sid, cnt in sorted(per_sub.items()):
                     payload += struct.pack('>HI', sid, cnt)
+                # SACK bitmap: which of [nxt, nxt+128) are missing (not in buf)
+                lo = hi = 0
+                for i in range(128):
+                    if (nxt + i) not in buf:
+                        if i < 64:
+                            lo |= (1 << i)
+                        else:
+                            hi |= (1 << (i - 64))
+                payload += struct.pack('>QQ', lo, hi)
                 s.sendto(payload, addr)
         except Exception:
             pass
@@ -264,6 +275,8 @@ class MptcpGroupSender(object):
         self._last_retry = time.time()
         self._lock = threading.Lock()
         self._recv_counts = {}         # sid_int -> receiver received count
+        self._recv_next = 0            # receiver next_dsn (for tail recovery)
+        self._sack_missing = 0         # 128-bit missing-DSN bitmap from recv
         self._rl_counter = 0
         self._rl_state = 0
         for ipb, sid, path in dests:
@@ -328,10 +341,14 @@ class MptcpGroupSender(object):
                         sid, cnt = struct.unpack('>HI', data[off:off + 6])
                         rcv[sid] = cnt
                         off += 6
+                    lo, hi = struct.unpack('>QQ', data[off:off + 16])
+                    sack = (hi << 64) | lo
                 except Exception:
                     continue
                 with self._lock:
                     self._recv_counts = dict(rcv)
+                    self._recv_next = nxt
+                    self._sack_missing = sack
                     # keep recv_count for stats; prune the subflow's assigned
                     # DSNs once the receiver has ordered them (nxt = next_dsn),
                     # so in_flight stays accurate while window-throttled.
@@ -368,15 +385,26 @@ class MptcpGroupSender(object):
         self._last_rcv = dict(rcv)
 
     def _retransmit_range(self, start, end):
-        limit = min(end, start + self.NAK_BATCH)
+        """Retransmit the gap; uses the receiver's 128-bit SACK bitmap to send
+        ONLY the DSNs that are actually missing (avoids re-sending segments
+        already delivered -> much lower dup). Beyond the bitmap window it
+        falls back to an interval retransmit (bounded by NAK_BATCH)."""
+        with self._lock:
+            sack = self._sack_missing
         n = 0
-        for dsn in range(start, limit):
+        for i in range(min(128, end - start)):
+            if sack & (1 << i):
+                if self._retransmit(start + i):
+                    n += 1
+                time.sleep(self.NAK_PACE)
+        limit = min(end, start + self.NAK_BATCH)
+        for dsn in range(start + 128, limit):
             if self._retransmit(dsn):
                 n += 1
             time.sleep(self.NAK_PACE)
         if n:
-            print '  [sender] NAK: recovered %d missing DSN(s) %d..%d on healthy subflows' % (
-                n, start, limit - 1)
+            print '  [sender] NAK: recovered %d missing DSN(s) from %d on healthy subflows' % (
+                n, start)
 
     def _retransmit(self, dsn):
         """Deliver dsn on a healthy subflow (round-robin); drop any that fail."""
@@ -512,6 +540,49 @@ class MptcpGroupSender(object):
                 pass
         except Exception as e:
             print '  [rl] step failed: %s' % e
+
+    def run_loop(self, stop_file=None, settle=3.0):
+        """Main send loop with graceful shutdown: keep sending until stop_file
+        appears (or KeyboardInterrupt); then stop assigning new DSNs, let the
+        NAK thread + active tail recovery fill the remaining gap, and close
+        the subflows (FIN) so the receiver drains a complete ordered stream.
+        (Replaces a hard SIGTERM kill, which truncated the tail -> in_buf.)"""
+        dsn = 0
+        try:
+            while True:
+                if stop_file and os.path.exists(stop_file):
+                    break
+                self.send_next(dsn)
+                dsn += 1
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            pass
+        if stop_file:
+            deadline = time.time() + settle
+            while time.time() < deadline:
+                with self._lock:
+                    nxt = self._recv_next
+                    maxd = self.max_dsn
+                if nxt >= maxd:
+                    break                      # tail fully recovered
+                self._retransmit_remaining()
+                time.sleep(0.3)
+        for s in list(self.senders):
+            try:
+                s.close()
+            except Exception:
+                pass
+        print '  [sender] gracefully closed after %d DSNs (recv next=%d)' % (
+            dsn, self._recv_next)
+
+    def _retransmit_remaining(self):
+        """Retransmit the gap [recv_next, max_dsn) on healthy subflows during
+        graceful tail recovery (does NOT assign new DSNs)."""
+        with self._lock:
+            nxt = self._recv_next
+            maxd = self.max_dsn
+        if nxt < maxd:
+            self._retransmit_range(nxt, maxd)
 
 
 def demo_send_recv(dst_ip, port, n_subflows, n_seg, sleep=0.01):
