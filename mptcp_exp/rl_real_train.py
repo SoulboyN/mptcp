@@ -1,30 +1,13 @@
 #!/usr/bin/env python2
 """
-rl_real_train.py -- real-environment (slow) RL training for the MPTCP
-experiment.
+rl_real_train.py -- real-environment (slow) fine-tuning for the RESIDUAL RL
+congestion control.
 
-Why real training
------------------
-The thesis topic is "SDN global traffic awareness -> MPTCP dynamic
-heterogeneous subflow congestion control". To make the learned policy
-RELIABLE, we do not trust only the simplified offline simulator: we
-pre-train there, then FINE-TUNE on the REAL 3-switch BMv2 network where
-the reward comes from ACTUAL ECN marks, actual loss, actual delay.
-
-Flow
-----
-1. Load a pre-trained policy (rl_train_mptcp.py output, or start fresh).
-2. For each training round:
-     a. decide actions with the current policy (path selection + cwnd)
-     b. run real traffic on the live 3-switch topology
-     c. read REAL per-switch ECN counters (register ecn_marks via CLI)
-     d. measure REAL received/loss/delay at the receivers
-     e. compute reward = util - loss - delay ; update Q tables
-     f. save the policy periodically
-3. Stop when loss is low and reward plateaus (or after N rounds).
-
-Because simple_switch is single-threaded, keep per-round traffic modest
-so real ECN/loss signals are meaningful rather than CPU-overload drops.
+Pre-trained offline (rl_train_mptcp.py) then FINE-TUNED on the LIVE 3-switch
+BMv2 topology where the reward comes from ACTUAL ECN marks, actual loss,
+actual delay. The learned policy is a RESIDUAL over the DCQCN local mechanism:
+  final cwnd = clamp( DCQCN_base_cwnd(ecn) x residual_action, min, max )
+with the residual action quantized to {x0.5, x1.0, x1.5}.
 """
 
 import json
@@ -32,13 +15,15 @@ import os
 import time
 import random
 
-# reuse the offline trainer's structure
 _HERE = os.path.dirname(os.path.abspath(__file__))
 import rl_train_mptcp as rtm
 
-# cwnd multiplier actions (low level), path preference (high level)
-CWND_ACTIONS = [2.0, 1.0, 0.5, 0.25]
-PATH_ACTIONS = ['sw', 'direct']
+# ---- quantization / residual design (must match RlScheduler + offline) ----
+N_STATES = 5
+STATE_ECN = [0.02, 0.1, 0.25, 0.5]
+DCQCN_MUL = [1.0, 0.8, 0.6, 0.4, 0.25]
+BASE_CWND = 32.0
+ACTIONS_RESIDUAL = [0.5, 1.0, 1.5]
 
 
 def load_policy(path=None):
@@ -66,139 +51,93 @@ def read_real_ecn(thrift_port, port_idx, budget):
     return 0.0
 
 
-class RealEnvTrainer(object):
-    """Drives RL fine-tuning against the live 3-switch topology."""
+def congestion_state(ecn_agg, avg_occ):
+    """Quantize the aggregate congestion signal into 5 levels (0..4)."""
+    sig = max(ecn_agg, avg_occ)
+    for i, thr in enumerate(STATE_ECN):
+        if sig < thr:
+            return i
+    return 4
 
-    def __init__(self, flows, sw_ports, min_cwnd=4, max_cwnd=128):
+
+class RealEnvTrainer(object):
+    """Fine-tunes the residual policy against the live 3-switch topology."""
+
+    def __init__(self, flows, sw_ports):
         self.flows = flows
         self.sw_ports = sw_ports            # {sw_idx: thrift_port}
-        self.min_cwnd = min_cwnd
-        self.max_cwnd = max_cwnd
-        # RL tables: warm-start from the offline pre-trained Q tables so the
-        # real-environment fine-tune does not start from a cold blank state.
+        # warm-start the residual Q table from the offline pre-training
         pol = load_policy() or {}
-        # low level: cwnd actions (3 states x 4 actions) -- same action space
-        # as the offline Q_cwnd, reuse it verbatim.
-        Qc = pol.get('Q_cwnd')
-        if Qc and len(Qc) == 3 and len(Qc[0]) == len(CWND_ACTIONS):
-            self.Q_cwnd = [list(r) for r in Qc]
+        Qr = pol.get('Q_residual')
+        if Qr and len(Qr) == N_STATES and len(Qr[0]) == len(ACTIONS_RESIDUAL):
+            self.Q_res = [list(r) for r in Qr]
         else:
-            self.Q_cwnd = [[0.0] * len(CWND_ACTIONS) for _ in range(3)]
-        # high level: the offline policy picks a path-ratio PROFILE per state;
-        # its cheap-path share becomes the prior for preferring switch paths
-        # (wifi is free) over the direct link.
-        pp = pol.get('policy_path', [])
-        prof = pol.get('profiles', getattr(rtm, 'PROFILES', []))
-        self.Q_path = []
-        for s in range(3):
-            idx = pp[s] if s < len(pp) and pp[s] < len(prof) else 1
-            cheap = prof[idx][0]
-            self.Q_path.append([cheap, 1.0 - cheap])   # [sw, direct]
-        # per-subflow state
-        self.cwnd = {}
-        self.in_flight = {}
-        self.loss = {}
-        self.delay = {}
-        for f in flows:
-            for sf in f.subflows:
-                self.cwnd[sf.sid] = 10
-                self.in_flight[sf.sid] = 0
-                self.loss[sf.sid] = 0.0
-                self.delay[sf.sid] = 0.0
+            self.Q_res = [[0.0] * len(ACTIONS_RESIDUAL) for _ in range(N_STATES)]
 
     def decide_actions(self, ecn_by_sw, avg_occ):
-        """High: path type; Low: cwnd multiplier. Returns (state, cwnd)."""
+        """Greedy residual action for the current (quantized) state.
+        Returns (state, residual_mul)."""
         ecn_agg = max(ecn_by_sw.values()) if ecn_by_sw else 0.0
-        if ecn_agg >= 0.4 or avg_occ >= 0.8:
-            state = 2
-        elif ecn_agg >= 0.1 or avg_occ >= 0.5:
-            state = 1
-        else:
-            state = 0
-        # greedy from Q tables (or learned policy)
-        path_idx = max(range(len(PATH_ACTIONS)),
-                       key=lambda i: self.Q_path[state][i])
-        cwnd_idx = max(range(len(CWND_ACTIONS)),
-                       key=lambda i: self.Q_cwnd[state][i])
-        return state, PATH_ACTIONS[path_idx], CWND_ACTIONS[cwnd_idx]
+        state = congestion_state(ecn_agg, avg_occ)
+        a = max(range(len(ACTIONS_RESIDUAL)), key=lambda i: self.Q_res[state][i])
+        return state, ACTIONS_RESIDUAL[a]
 
-    def update(self, state, path_idx, cwnd_idx, reward, alpha=0.3, gamma=0.9):
-        """Q update from a real-world reward."""
-        self.Q_path[state][path_idx] += alpha * (
-            reward + gamma * max(self.Q_path[state]) - self.Q_path[state][path_idx])
-        self.Q_cwnd[state][cwnd_idx] += alpha * (
-            reward + gamma * max(self.Q_cwnd[state]) - self.Q_cwnd[state][cwnd_idx])
+    def update(self, state, res_idx, reward, alpha=0.3, gamma=0.9):
+        self.Q_res[state][res_idx] += alpha * (
+            reward + gamma * max(self.Q_res[state]) - self.Q_res[state][res_idx])
 
-    # ---- real-environment training loop ----
     def train_loop(self, rounds, sw_ports, run_traffic, read_ecn,
                    save_every=5, out_path=None):
-        """Fine-tune the policy on the LIVE 3-switch topology.
+        """Fine-tune the residual policy on the LIVE topology.
 
-        run_traffic(path_weights, cwnds) -> (received, sent, delay):
-            callback that actually sends traffic over the live topology and
-            returns REAL metrics. The caller provides it (it needs access to
-            the netns/switch setup in run_mptcp.py).
-        read_ecn(sw_idx) -> ecn_ratio: callback reading a switch's REAL
-            ecn_marks register.
+        run_traffic(path_weights, cwnd_mul) -> (received, sent, delay):
+            callback that sends real traffic; cwnd_mul scales the burst so the
+            residual action really affects how much is sent.
+        read_ecn(sw_idx) -> ecn_ratio: callback reading a switch's ecn_marks.
         Each round:
-          - decide a proportional split profile (high level) + cwnd (low)
-          - call run_traffic to get real received/sent/delay
-          - reward = util - delay_penalty - loss_penalty - cost
-          - read real per-switch ECN for the state
-          - Q update, periodic save.
+          - read real ECN -> quantized state
+          - pick a residual action; cwnd_mul = DCQCN(state) * residual
+          - run_traffic -> real received/sent/delay
+          - reward = util - delay - loss - cost ; Q update ; periodic save
         """
         from mptcp_scheduler import PATH_COST, COST_WEIGHT
         for rnd in range(rounds):
-            # ---- real ECN state (SDN global view) ----
             ecn_by_sw = {}
             for s in sw_ports:
                 ecn_by_sw[s] = read_ecn(s)
             ecn_agg = max(ecn_by_sw.values()) if ecn_by_sw else 0.0
-            # average occupancy across subflows
-            occs = [self.in_flight.get(sf.sid, 0) / max(self.cwnd.get(sf.sid, 10), 1)
-                    for f in self.flows for sf in f.subflows]
-            avg_occ = sum(occs) / max(len(occs), 1)
+            # low occupancy placeholder: the fine-tune state is dominated by
+            # the REAL per-switch ECN (the trainer has no in-flight feedback)
+            occs = [0.1]
+            avg_occ = sum(occs) / len(occs)
 
-            state, path_type, cwnd_mul = self.decide_actions(ecn_by_sw, avg_occ)
-            path_idx = PATH_ACTIONS.index(path_type)
-            cwnd_idx = CWND_ACTIONS.index(cwnd_mul)
+            state, res_mul = self.decide_actions(ecn_by_sw, avg_occ)
+            res_idx = ACTIONS_RESIDUAL.index(res_mul)
+            # effective window = DCQCN base x residual, normalized
+            cwnd_mul = DCQCN_MUL[state] * res_mul
 
-            # proportional weights for the chosen path type (real split)
+            # proportional weights (inverse cost) for the traffic burst
             weights = {}
             for f in self.flows:
                 for sf in f.subflows:
-                    if path_type == 'sw' and not sf.path.startswith('sw'):
-                        weights[sf.sid] = 0.0
-                    elif path_type == 'direct' and sf.path != 'direct':
-                        weights[sf.sid] = 0.0
-                    else:
-                        # inverse of cost as a base proportion
-                        weights[sf.sid] = 1.0 / max(PATH_COST.get(sf.path, 1.0), 0.1)
+                    weights[sf.sid] = 1.0 / max(PATH_COST.get(sf.path, 1.0), 0.1)
             tw = sum(weights.values())
             norm = {k: v / tw for k, v in weights.items()} if tw else {}
 
-            # run REAL traffic with these proportions and cwnd
             recv, sent, delay = run_traffic(norm, cwnd_mul)
             util = recv / max(sent, 1)
             loss = (sent - recv) / max(sent, 1)
-            # path cost of the split (weighted)
             split_cost = sum(norm.get(sf.sid, 0) * PATH_COST.get(sf.path, 0)
                              for f in self.flows for sf in f.subflows)
             reward = util - 0.4 * (delay / 100.0) - 1.5 * loss - COST_WEIGHT * split_cost
 
-            # update Q with the REAL reward
-            self.update(state, path_idx, cwnd_idx, reward)
-            # track state
-            for f in self.flows:
-                for sf in f.subflows:
-                    self.loss[sf.sid] = loss
-                    self.delay[sf.sid] = delay
+            self.update(state, res_idx, reward)
 
             if (rnd + 1) % save_every == 0 or rnd == rounds - 1:
                 p = self.save(out_path)
-                print '  [train rnd %d] ecn=%s state=%d path=%s cwnd=%.2f recv=%d/%d delay=%.0fms reward=%.3f -> %s' % (
+                print '  [train rnd %d] ecn=%s state=%d res=x%.2f cwnd_mul=%.2f recv=%d/%d delay=%.0fms reward=%.3f -> %s' % (
                     rnd + 1, {k: round(v, 2) for k, v in ecn_by_sw.items()},
-                    state, path_type, cwnd_mul, recv, sent, delay, reward, p)
+                    state, res_mul, cwnd_mul, recv, sent, delay, reward, p)
         return self
 
     def save(self, path=None):
@@ -206,16 +145,14 @@ class RealEnvTrainer(object):
             path = os.path.join(_HERE, 'policy_mptcp_real.json')
         with open(path, 'w') as f:
             json.dump({
-                'Q_path': self.Q_path,
-                'Q_cwnd': self.Q_cwnd,
-                'actions_path': PATH_ACTIONS,
-                'actions_cwnd': CWND_ACTIONS,
-                # greedy policies consumed by the runtime schedulers
-                'policy_path': [max(range(len(PATH_ACTIONS)),
-                                    key=lambda i: self.Q_path[s][i])
-                                for s in range(3)],
-                'policy_cwnd': [max(range(len(CWND_ACTIONS)),
-                                    key=lambda i: self.Q_cwnd[s][i])
-                                for s in range(3)],
+                'Q_residual': self.Q_res,
+                'actions_residual': ACTIONS_RESIDUAL,
+                # greedy residual policy for the runtime RlScheduler
+                'policy_residual': [max(range(len(ACTIONS_RESIDUAL)),
+                                        key=lambda i: self.Q_res[s][i])
+                                    for s in range(N_STATES)],
+                # path selection stays heuristic (inverse pressure)
+                'actions_path': ['sw', 'direct'],
+                'policy_path': [0, 0, 0, 0, 0],
             }, f, indent=2)
         return path

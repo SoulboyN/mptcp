@@ -531,7 +531,9 @@ def main():
             Batches per source namespace into ONE subprocess (it used to spawn
             one subprocess PER PACKET -- that process-spawn was the training
             bottleneck and made each RL round take tens of seconds)."""
-            n = 15                              # segments per round
+            # segments scale with the effective window (DCQCN base x residual),
+            # so the RL residual action really changes how much is sent
+            n = int(15 * max(cwnd_mul, 0.25))
             port = 7500
             listeners = []
             for f in flows[:4]:

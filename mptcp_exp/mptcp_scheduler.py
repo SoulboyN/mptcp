@@ -310,32 +310,47 @@ class RlPathSelector(object):
 
 
 class RlScheduler(object):
-    """Embedded SDN-global scheduler for a real sender (MptcpGroupSender).
+    """Embedded SDN-global scheduler (RESIDUAL + quantized) for a real sender.
 
-    Every step it reads the global state (per-switch ECN + per-subflow
-    in-flight) and produces, from the fine-tuned policy:
-      - per-subflow cwnd (RL low level; DCQCN cut on high-ECN switch paths)
-      - per-subflow path weights (RL high level, inverse of pressure)
-    It reuses RlCwndController (policy loading / congestion state / cwnd
-    action) and RlPathSelector (path pressure / weights), so decisions match
-    the training code exactly. The subflow objects it drives only need
-    sid / sid_int / path / in_flight / _effective_cwnd.
+    Every step:
+      - quantizes the global congestion state into 5 levels (0..4)
+      - computes a LOCAL-mechanism base cwnd per subflow (DCQCN: switch ECN
+        shrinks the base on switch paths; direct keeps the full base)
+      - applies the RL residual policy: a quantized residual action
+        {x0.5, x1.0, x1.5} multiplies the base
+      - produces path weights (inverse pressure) for subflow selection
+    So RL only learns a small correction ON TOP of the existing DCQCN/Credit
+    mechanisms -- "global RL refines local mechanisms" (the paper narrative).
     """
 
-    BASE_CWND = 16
+    BASE_CWND = 32
     MIN_CWND = 4
     MAX_CWND = 128
-    DCQCN_CUT = 0.5                 # switch-subflow cwnd cut when ECN high
-    DCQCN_HIGH = 0.4
+    # 5-level state quantization boundaries (ECN ratio / occupancy)
+    STATE_ECN = [0.02, 0.1, 0.25, 0.5]
+    # DCQCN local-mechanism base multiplier per state (switch paths)
+    DCQCN_MUL = [1.0, 0.8, 0.6, 0.4, 0.25]
+    # quantized residual actions (multipliers on the base)
+    RESIDUAL = [0.5, 1.0, 1.5]
+    DEFAULT_POLICY_RESIDUAL = [1, 1, 1, 1, 1]   # maintain the base
 
     def __init__(self, subflows, policy_path=None, base_cwnd=BASE_CWND, n_sw=3):
         self.subflows = subflows
         self.base_cwnd = base_cwnd
-        # cwnd controller (loads policy_cwnd / actions_cwnd) + path selector
-        # (loads policy_path / actions_path); no real Flow needed -- a tiny
-        # stand-in holding the live subflow sockets is enough.
+        self.actions_residual = list(self.RESIDUAL)
+        self.policy_residual = list(self.DEFAULT_POLICY_RESIDUAL)
+        if policy_path and os.path.exists(policy_path):
+            try:
+                cfg = json.load(open(policy_path))
+                ar = cfg.get('actions_residual')
+                if ar and len(ar) >= 3:
+                    self.actions_residual = list(ar)
+                pr = cfg.get('policy_residual')
+                if pr and len(pr) == 5:
+                    self.policy_residual = [int(x) for x in pr]
+            except Exception:
+                pass
         self._flow = type('_Flow', (), {'subflows': subflows})()
-        self.ctrl = RlCwndController([self._flow], policy_path=policy_path)
         self.sel = RlPathSelector([self._flow], policy_path=policy_path, n_sw=n_sw)
         for sf in subflows:
             self.sel.sockets[sf.sid] = sf
@@ -344,11 +359,28 @@ class RlScheduler(object):
         self.last_state = 0
 
     def congestion_state(self, ecn_agg, avg_occ):
-        return self.ctrl.congestion_state(ecn_agg, avg_occ)
+        """Quantize the aggregate congestion signal into 5 levels (0..4)."""
+        sig = max(ecn_agg, avg_occ)
+        for i, thr in enumerate(self.STATE_ECN):
+            if sig < thr:
+                return i
+        return 4
+
+    def _base_cwnd(self, sf):
+        """Local-mechanism base cwnd: DCQCN shrinks switch-path bases by that
+        switch's ECN; direct paths keep the full base (credit domain)."""
+        if sf.path.startswith('sw'):
+            s_idx = int(sf.path[2])             # 'sw1' -> 1
+            ecn = self.sw_ecn.get(s_idx, 0.0)
+            for i, thr in enumerate(self.STATE_ECN):
+                if ecn < thr:
+                    return max(self.MIN_CWND, self.base_cwnd * self.DCQCN_MUL[i])
+            return max(self.MIN_CWND, self.base_cwnd * self.DCQCN_MUL[4])
+        return self.base_cwnd
 
     def step(self, sw_ecn, per_sub):
-        """One scheduling round. sw_ecn: {sw_idx: ratio}; per_sub: {sid_int: cnt}.
-        Returns (state, {sid: cwnd}, {sid: weight})."""
+        """One scheduling round: quantize state, apply residual policy on the
+        DCQCN base, produce path weights. Returns (state, {sid: cwnd}, weights)."""
         for sf in self.subflows:            # re-bind (reconnect swaps sockets)
             self.sel.sockets[sf.sid] = sf
         self.sel.observe(sw_ecn)
@@ -361,13 +393,10 @@ class RlScheduler(object):
         avg_occ = sum(occs) / max(len(occs), 1)
         state = self.congestion_state(ecn_agg, avg_occ)
         self.last_state = state
-        mul = self.ctrl.cwnd_action_for(state)      # policy cwnd multiplier
+        res_mul = self.actions_residual[self.policy_residual[state]]
         for sf in self.subflows:
-            cw = max(self.MIN_CWND, min(self.MAX_CWND, self.base_cwnd * mul))
-            if sf.path.startswith('sw'):
-                s_idx = int(sf.path[2])             # 'sw1' -> 1
-                if self.sw_ecn.get(s_idx, 0.0) >= self.DCQCN_HIGH:
-                    cw = max(self.MIN_CWND, cw * self.DCQCN_CUT)
+            base = self._base_cwnd(sf)
+            cw = max(self.MIN_CWND, min(self.MAX_CWND, base * res_mul))
             sf.cwnd = cw
             self.cwnd[sf.sid] = cw
         weights = self.sel.path_weights(self._flow)
