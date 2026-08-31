@@ -331,8 +331,8 @@ class RlScheduler(object):
     # DCQCN local-mechanism base multiplier per state (switch paths)
     DCQCN_MUL = [1.0, 0.8, 0.6, 0.4, 0.25]
     # quantized residual actions (multipliers on the base)
-    RESIDUAL = [0.5, 1.0, 1.5]
-    DEFAULT_POLICY_RESIDUAL = [1, 1, 1, 1, 1]   # maintain the base
+    RESIDUAL = [0.5, 0.75, 1.0, 1.25, 1.5]
+    DEFAULT_POLICY_RESIDUAL = [2, 2, 2, 2, 2]   # maintain the base (x1.0)
 
     def __init__(self, subflows, policy_path=None, base_cwnd=BASE_CWND, n_sw=3):
         self.subflows = subflows
@@ -343,7 +343,7 @@ class RlScheduler(object):
             try:
                 cfg = json.load(open(policy_path))
                 ar = cfg.get('actions_residual')
-                if ar and len(ar) >= 3:
+                if ar and len(ar) >= 5:
                     self.actions_residual = list(ar)
                 pr = cfg.get('policy_residual')
                 if pr and len(pr) == 5:

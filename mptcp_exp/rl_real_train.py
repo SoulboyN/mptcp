@@ -23,7 +23,7 @@ N_STATES = 5
 STATE_ECN = [0.02, 0.1, 0.25, 0.5]
 DCQCN_MUL = [1.0, 0.8, 0.6, 0.4, 0.25]
 BASE_CWND = 32.0
-ACTIONS_RESIDUAL = [0.5, 1.0, 1.5]
+ACTIONS_RESIDUAL = [0.5, 0.75, 1.0, 1.25, 1.5]
 
 
 def load_policy(path=None):

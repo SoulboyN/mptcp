@@ -27,7 +27,7 @@ N_STATES = 5                          # congestion levels 0..4
 STATE_ECN = [0.02, 0.1, 0.25, 0.5]    # 5-level quantizer boundaries
 DCQCN_MUL = [1.0, 0.8, 0.6, 0.4, 0.25]  # DCQCN base cwnd multiplier per level
 BASE_CWND = 32.0
-ACTIONS_RESIDUAL = [0.5, 1.0, 1.5]    # quantized residual actions (x base)
+ACTIONS_RESIDUAL = [0.5, 0.75, 1.0, 1.25, 1.5]    # quantized residual actions
 EPISODES = 300
 INNER = 20
 ALPHA = 0.3
@@ -42,18 +42,20 @@ def env_fingerprint():
 
 
 def step_sim(congestion, res_mul):
-    """Fluid-model reward for taking residual action res_mul at congestion
-    level 0..4: base cwnd shrinks with congestion (DCQCN), the residual
-    multiplies it; demand scaled by the resulting window drives util/loss.
-    An aggressive residual at high congestion inflates queueing delay, so
-    the model can learn 'be aggressive when idle, conservative when busy'."""
+    """Fluid-model reward for residual action res_mul at congestion level 0..4.
+    base cwnd shrinks with congestion (DCQCN); the residual multiplies it.
+    util saturates at full load; overload creates loss; an aggressive residual
+    at higher congestion inflates queueing delay strongly, so the model learns
+    a DIFFERENT residual per state (grow to saturate when idle, be conservative
+    when congested) instead of always picking an extreme."""
     base = BASE_CWND * DCQCN_MUL[congestion]
     cw = base * res_mul
-    demand = 50.0 * (cw / BASE_CWND)          # normalized demand vs bottleneck
+    demand = 95.0 * (cw / BASE_CWND)          # demand vs bottleneck 100
     cap = 100.0
-    util = min(demand, cap) / cap
-    loss = max(0.0, demand - cap) / max(demand, 1e-9)
-    delay = 5.0 + congestion * 20.0 + res_mul * congestion * 10.0
+    load = demand / cap
+    util = min(load, 1.0)
+    loss = max(0.0, load - 1.0)
+    delay = 5.0 + congestion * 20.0 + res_mul * congestion * 25.0
     return util, delay, loss
 
 
@@ -82,9 +84,9 @@ def train():
 
 
 def main():
-    print '=== Offline residual Q-learning (5 states x 3 residual actions) ==='
+    print '=== Offline residual Q-learning (5 states x 5 residual actions) ==='
     Qr, pr = train()
-    print 'Q_residual (state -> x0.5 / x1.0 / x1.5):'
+    print 'Q_residual (state -> x0.5 / x0.75 / x1.0 / x1.25 / x1.5):'
     for c in range(N_STATES):
         print '  state', c, ['%.2f' % v for v in Qr[c]]
     print 'policy_residual (state->action):',

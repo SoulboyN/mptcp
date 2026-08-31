@@ -66,7 +66,7 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 多流并发演示 | step 11 同时 3 条 MPTCP 连接(各 3~4 子流),RL 全局感知(共享 ECN)经受真实跨流拥塞 | 3 流独立 receiver 统计;切一条不影响其他流 |
 | 对比实验 T5 | `compare_cc`:RL-cwnd vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 实测 RL/固定/Reno 吞吐差异 + jain 指标 |
 | 动态子流管理 | `add_subflow`/`remove_subflow` + cmd_file 控制通道(模拟 ADD_ADDR/REMOVE_ADDR);sender 状态导出应用层 SSN(DSS 映射轴) | 单测:动态加 sw3、移 sw1,in_buf 0 按序 |
-| 残差 RL + 量化 | DCQCN 基线 + **5 档量化状态** + **3 档残差动作**{×0.5/1.0/1.5}:`cwnd=clamp(基线×残差)`;RL 只学"比局部机制更激进/保守" | 离线学到[1.5,1.5,1.5,0.5,0.5](低拥塞激进、高拥塞保守);部署 state0→cwnd48,高拥塞 sw→cwnd4 |
+| 残差 RL + 量化 | DCQCN 基线 + **5 档量化状态** + **5 档残差动作**{×0.5/0.75/1.0/1.25/1.5}:`cwnd=clamp(基线×残差)`;RL 只学"比局部机制更激进/保守" | 离线学到[1.0,1.25,1.5,0.5,0.5](低拥塞吃满带宽、高拥塞保守);部署单测通过 |
 
 ## 三域拥塞控制(真实闭环)
 
