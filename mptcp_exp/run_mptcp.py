@@ -691,6 +691,8 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8):
     def sw_ip(i, s):
         return '{}.{}'.format(_SW_NET[s], i)
     modes = [('rl', 'RL-cwnd (fine-tuned)'),
+             ('lia', 'MPTCP LIA (RFC 6356)'),
+             ('olia', 'MPTCP OLIA'),
              ('fixed', 'Fixed cwnd=32'),
              ('aimd', 'Pseudo-Reno (AIMD)')]
     print '\n=== 13. Congestion-control comparison (T5) ==='

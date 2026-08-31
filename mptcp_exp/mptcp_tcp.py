@@ -262,6 +262,10 @@ class MptcpGroupSender(object):
     NAK_POLL = 0.7               # seconds between NAK polls
     NAK_PACE = 0.003             # seconds between retransmitted DSNs
 
+    # RTT per path (matches run_mptcp.py's tc netem: sw1 WiFi 10ms, sw2 cell
+    # 30ms, sw3 fiber 2ms, direct unshaped). Used by LIA/OLIA coupled CC.
+    PATH_RTT = {'direct': 1.0, 'sw1': 10.0, 'sw2': 30.0, 'sw3': 2.0}
+
     def __init__(self, flow_id, dests, port, retry_interval=2.0, control_port=None,
                  policy_path=None, cc_mode='rl', fixed_cwnd=32):
         # dests: list of (dst_ip, sid_int, path)
@@ -277,8 +281,11 @@ class MptcpGroupSender(object):
         self._last_retry = time.time()
         self._lock = threading.Lock()
         self._recv_counts = {}         # sid_int -> receiver received count
+        self._recv_total = 0           # receiver unique-received watermark
         self._recv_next = 0            # receiver next_dsn (for tail recovery)
         self._sack_missing = 0         # 128-bit missing-DSN bitmap from recv
+        self._recv_deltas = {}         # sid_int -> delivered delta per NAK poll
+        self._prev_send = {}           # sid_int -> send_count at last CC step
         self._rl_counter = 0
         self._rl_state = 0
         for ipb, sid, path in dests:
@@ -293,6 +300,9 @@ class MptcpGroupSender(object):
         ctl = threading.Thread(target=self._nak_loop)
         ctl.daemon = True
         ctl.start()
+        dg = threading.Thread(target=self._diag_loop)
+        dg.daemon = True
+        dg.start()
 
     def _connect(self, ipb, sid, path='direct'):
         try:
@@ -349,19 +359,55 @@ class MptcpGroupSender(object):
                     continue
                 with self._lock:
                     self._recv_counts = dict(rcv)
+                    self._recv_total = sum(rcv.values())
                     self._recv_next = nxt
                     self._sack_missing = sack
-                    # keep recv_count for stats; prune the subflow's assigned
-                    # DSNs once the receiver has ordered them (nxt = next_dsn),
-                    # so in_flight stays accurate while window-throttled.
+                    # Prune a subflow's assigned DSNs once the receiver has
+                    # RECEIVED them (unique-count watermark = sum of per_sub),
+                    # NOT once it has ordered them (next_dsn). next_dsn stalls
+                    # on a reorder gap, and coupling the window to it froze the
+                    # whole connection when one subflow went slow/lossy; the
+                    # received watermark advances with any delivery, so an
+                    # out-of-order backlog keeps the window flowing.
                     for s in self.senders:
                         s.recv_count = rcv.get(s.sid_int, s.recv_count)
                         if s.assigned:
-                            s.assigned = [d for d in s.assigned if d >= nxt]
+                            s.assigned = [d for d in s.assigned
+                                          if d >= self._recv_total]
                 self._check_stalls(rcv)
+                with self._lock:
+                    self._recv_deltas = {
+                        sid: cnt - self._last_rcv.get(sid, 0)
+                        for sid, cnt in rcv.items()}
                 if nxt < maxd:
                     self._retransmit_range(nxt, maxd)
                 break
+
+    def _diag_loop(self):
+        """Per-second sender-state log (one line each): per-subflow window
+        state + receiver next_dsn + SACK missing count, to /tmp. Lets a stalled
+        flow be diagnosed after the fact (which subflow blocks next_dsn)."""
+        t0 = time.time()
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                live = [(s.sid_int, s.path, int(s.cwnd), len(s.assigned),
+                         s.send_count, s.recv_count) for s in self.senders]
+                dead = [(d[1], d[2]) for d in self.dead]
+                nxt = self._recv_next
+                rtot = self._recv_total
+                maxd = self.max_dsn
+                sack = self._sack_missing
+            import math
+            miss = bin(sack).count('1')
+            f = '/tmp/mptcp_sender_%d_live.log' % self.flow_id
+            try:
+                with open(f, 'a') as _f:
+                    _f.write('t=%5.1f dsn=%d rcv=%d next=%d miss=%d live=%s dead=%s\n' % (
+                        time.time() - t0, maxd, rtot, nxt, miss,
+                        live, [('%d.%s' % (self.flow_id, sid)) for sid, _ in dead]))
+            except Exception:
+                pass
 
     def _check_stalls(self, rcv):
         """Drop live subflows that delivered nothing new since the last poll
@@ -409,24 +455,20 @@ class MptcpGroupSender(object):
                 n, start)
 
     def _retransmit(self, dsn):
-        """Deliver dsn on a healthy subflow (round-robin); drop any that fail."""
+        """Deliver dsn on a healthy subflow; prefer the least-loaded (fewest
+        assigned) so retransmits spread instead of piling onto one slow/lossy
+        path, and drop any that fail."""
         with self._lock:
             if not self.senders:
                 return False
-            targets = list(self.senders)
-        s = targets[dsn % len(targets)]
-        try:
-            self._send_on(s, dsn)
-            return True
-        except Exception:
-            self._drop(s)
-            for t in targets:
-                try:
-                    self._send_on(t, dsn)
-                    return True
-                except Exception:
-                    self._drop(t)
-            return False
+            targets = sorted(self.senders, key=lambda s: len(s.assigned))
+        for s in targets:
+            try:
+                self._send_on(s, dsn)
+                return True
+            except Exception:
+                self._drop(s)
+        return False
 
     def _drop(self, s):
         with self._lock:
@@ -522,6 +564,8 @@ class MptcpGroupSender(object):
                 for sf in list(self.senders):
                     sf.cwnd = self.fixed_cwnd
                 print '  [cc] fixed cwnd=%d' % self.fixed_cwnd
+            elif self.cc_mode in ('lia', 'olia'):
+                state = self._cc_lia_step()
             elif self.cc_mode == 'aimd':
                 state = self._cc_aimd_step()
             else:
@@ -553,20 +597,68 @@ class MptcpGroupSender(object):
         except Exception as e:
             print '  [cc] step failed: %s' % e
 
-    def _cc_aimd_step(self):
-        """Additive-increase / multiplicative-decrease on observed loss
-        (pseudo-Reno): if the receiver reports a gap, halve cwnd; else +1."""
+    def _cc_lia_step(self):
+        """MPTCP LIA / OLIA coupled congestion control (RFC 6356).
+
+        Each scheduling step: a subflow that delivered less than half of what
+        it sent since the last NAK poll (recv_delta vs send delta) is treated
+        as congested and its cwnd is halved; otherwise the window grows with
+        the RFC 6356 coupled increase
+            alpha = cwnd_total * max_i(cwnd_i/rtt_i^2) / (sum_i cwnd_i/rtt_i)^2
+            cwnd_i += min(alpha / cwnd_total, 1 / cwnd_i)
+        so a fast path's share throttles the whole connection's growth (the
+        signature of MPTCP coupled congestion control). OLIA adds an
+        opportunistic boost for the best path (largest cwnd/rtt)."""
         with self._lock:
-            nxt = self._recv_next
-            maxd = self.max_dsn
-        for sf in list(self.senders):
-            if maxd - nxt > 8:
-                sf.cwnd = max(4, int(sf.cwnd / 2))
+            live = list(self.senders)
+            recv_d = dict(self._recv_deltas)
+        if not live:
+            return 0
+        cw = {s.sid_int: max(1.0, float(s.cwnd)) for s in live}
+        tot = float(sum(cw.values())) or 1.0
+        rtt = lambda s: self.PATH_RTT.get(s.path, 1.0)
+        share = lambda s: cw[s.sid_int] / rtt(s)
+        best_share = max(share(s) for s in live)
+        alpha = (tot * max(cw[s.sid_int] / (rtt(s) ** 2) for s in live)
+                 / (sum(share(s) for s in live) ** 2 or 1.0))
+        congested = 0
+        for s in live:
+            sid = s.sid_int
+            sent_d = s.send_count - self._prev_send.get(sid, s.send_count)
+            self._prev_send[sid] = s.send_count
+            if sent_d > 0 and recv_d.get(sid, 0) < 0.5 * sent_d:
+                s.cwnd = max(4.0, s.cwnd / 2)          # congested subflow
+                congested += 1
+                continue
+            inc = min(alpha / tot, 1.0 / cw[sid])
+            if self.cc_mode == 'olia' and share(s) >= best_share - 1e-9:
+                inc = max(inc, 1.0 / cw[sid])           # best-path boost
+            s.cwnd = min(128.0, s.cwnd + inc)
+        print '  [cc] %s cwnd=%s' % (
+            self.cc_mode, {s.sid_int: int(s.cwnd) for s in live})
+        return 2 if congested else (1 if any(s.cwnd > 20 for s in live) else 0)
+
+    def _cc_aimd_step(self):
+        """Pseudo-Reno (AIMD) on per-subflow delivered rate: a subflow whose
+        delivered rate is < half its send rate since the last NAK poll is
+        congested -> cwnd halved; otherwise cwnd grows by 1 (additive
+        increase). Same congestion signal as LIA, so loss (not reorder) drives
+        the decrease."""
+        with self._lock:
+            live = list(self.senders)
+            recv_d = dict(self._recv_deltas)
+        congested = 0
+        for s in live:
+            sid = s.sid_int
+            sent_d = s.send_count - self._prev_send.get(sid, s.send_count)
+            self._prev_send[sid] = s.send_count
+            if sent_d > 0 and recv_d.get(sid, 0) < 0.5 * sent_d:
+                s.cwnd = max(4, int(s.cwnd / 2))
+                congested += 1
             else:
-                sf.cwnd = min(64, int(sf.cwnd) + 1)
-        print '  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in self.senders}
-        # coarse state for the monitor (based on gap size)
-        return 2 if maxd - nxt > 8 else (1 if maxd - nxt > 2 else 0)
+                s.cwnd = min(64, int(s.cwnd) + 1)
+        print '  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in live}
+        return 2 if congested else (1 if any(s.cwnd > 20 for s in live) else 0)
 
     def run_loop(self, stop_file=None, settle=3.0, cmd_file=None):
         """Main send loop with graceful shutdown: keep sending until stop_file

@@ -14,7 +14,7 @@ DCQCN + Credit + RL 三域协同拥塞控制。
 | `run_mptcp.py` | 主脚本:16 命名空间 + 3 台 BMv2(独立子网/thrift/ECN)+ 直连 veth;异构配置;多里程碑演示 + 真实训练 |
 | `tcp_stack.py` | 自定义 TCP:握手/序号/ACK/RTO 重传/cwnd(可被 RL 覆盖)+ 重传路径 |
 | `mptcp_io.py` | DSN/SSN 标记的传输:发送端按 SSN 编号,接收端按 DSN 重组 |
-| `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 + **应用层 cwnd/credit 窗口**(RL 设置 cwnd,in_flight < min(cwnd, credit) 才发) |
+| `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 + **应用层 cwnd/credit 窗口**(RL 设置 cwnd,in_flight < min(cwnd, credit) 才发);`cc_mode` 支持 `rl`/`lia`/`olia`/`fixed`/`aimd` 五种拥塞控制 |
 | `mptcp_scheduler.py` | 多交换机感知调度:DCQCN(每交换机独立 ECN)+ Credit + RL(路径比例/cwnd/成本);`RlScheduler` 内嵌调度器驱动真实发送 |
 | `rl_train_mptcp.py` | 离线分层 Q-learning(路径比例 profile + cwnd),交替冻结训练;导出 Q 表数值 |
 | `rl_real_train.py` | 真实环境训练:读真实 ECN/丢包/时延做奖励,微调策略;从离线 Q **warm-start**,保存时导出 `policy_path`/`policy_cwnd` 供调度器加载 |
@@ -64,7 +64,9 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 优雅结束 | 发送器 stop 文件触发:停发新 DSN → NAK 收尾补缺口 → FIN 关闭(替代强杀截断) | 尾部 in_buf 归 0 |
 | SACK 精确报缺 | receiver 回报 128-bit 缺失 DSN 位图,sender 只重传缺失段 | dup 从几十~几百降到 ~12 |
 | 多流并发演示 | step 11 同时 3 条 MPTCP 连接(各 3~4 子流),RL 全局感知(共享 ECN)经受真实跨流拥塞 | 3 流独立 receiver 统计;切一条不影响其他流 |
-| 对比实验 T5 | `compare_cc`:RL-cwnd vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 实测 RL/固定/Reno 吞吐差异 + jain 指标 |
+| 对比实验 T5 | `compare_cc`:RL-cwnd vs MPTCP LIA vs OLIA vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 5 模式全健康(RL jain 0.997,OLIA 1.000);修复"第三条流塌缩"缺陷 |
+| 第三条流修复 | 发送器窗口水位耦合于按序 `next_dsn` → 乱序缺口冻结整条连接;改为按接收方**去重接收水位** `recv_total` 释放窗口;重传优先最空闲子流 | 修复后同一次运行仍出现子流 connect failed 但不再卡死(0.1→87 seg/s) |
+| MPTCP 标准基线 | `cc_mode='lia'/'olia'`:RFC 6356 耦合拥塞控制(`alpha=cwnd_total·max(cwnd/rtt²)/(Σ cwnd/rtt)²`);LIA/OLIA 在同一应用层框架实现,与残差 RL 苹果对苹果 | 实测聚合吞吐 RL 86.6 / LIA 85.4 / OLIA 87.0 seg/s,同一水平;OLIA 最均衡 |
 | 动态子流管理 | `add_subflow`/`remove_subflow` + cmd_file 控制通道(模拟 ADD_ADDR/REMOVE_ADDR);sender 状态导出应用层 SSN(DSS 映射轴) | 单测:动态加 sw3、移 sw1,in_buf 0 按序 |
 | 残差 RL + 量化 | DCQCN 基线 + **5 档量化状态** + **5 档残差动作**{×0.5/0.75/1.0/1.25/1.5}:`cwnd=clamp(基线×残差)`;RL 只学"比局部机制更激进/保守" | 离线学到[1.0,1.25,1.5,0.5,0.5](低拥塞吃满带宽、高拥塞保守);部署单测通过 |
 
@@ -82,4 +84,5 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 ## 待办
 
 - 交互/--demo 接线动态 add/remove 命令(core 机制已通)
-- 完整多流对比实验的定量数据分析
+- 发送循环 10ms 调度上限(~100 seg/s)限制 CC 区分度,需提高发送速率上限后重测
+- policy_mptcp_real.json 已随完整实验重训为 5 级残差(当前 [1.0,1.25,1.5,0.5,0.5])
