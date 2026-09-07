@@ -105,25 +105,39 @@ def run_cli(cmds, thrift_port=9090):
 
 
 def ecn_collector():
-    """Periodically read each switch's ecn_marks register and write the SDN
-    global view to /tmp/ecn_global.json (shared; RL-driven senders read it
-    every scheduling round to do DCQCN + RL state)."""
+    """Periodically read each switch's ecn_marks / egress_total registers and
+    write the SDN global view to /tmp/ecn_global.json (shared; RL-driven
+    senders read it every scheduling round to do DCQCN + RL state).
+
+    Both registers are CUMULATIVE per-egress-port counters (incremented in
+    P4 on every CE mark / every egress packet), so the ECN ratio is a
+    DELTA ratio d(marks)/d(total) between two polls -- dividing the raw
+    counter by a constant would drift to 1.0 over time and pin RL to the
+    most-congested state regardless of the actual network."""
     import json as _json
+    prev = {}   # switch -> (marks, total)
     while True:
         try:
             ecn = {}
             for s in range(1, N_SW + 1):
-                out, _ = run_cli('register_read ecn_marks 0\n',
-                                 thrift_port=SW_PORT[s - 1])
-                v = 0.0
-                for line in out.splitlines():
-                    if '=' in line:
-                        try:
-                            v = min(1.0, float(line.split('=')[-1].strip()) / 200.0)
-                            break
-                        except ValueError:
-                            continue
-                ecn[s] = v
+                def _read(reg):
+                    out, _ = run_cli('register_read %s 0\n' % reg,
+                                     thrift_port=SW_PORT[s - 1])
+                    for line in out.splitlines():
+                        if '=' in line:
+                            try:
+                                return float(line.split('=')[-1].strip())
+                            except ValueError:
+                                continue
+                    return 0.0
+                marks = _read('ecn_marks')
+                total = _read('egress_total')
+                pmarks, ptotal = prev.get(s, (marks, total))
+                dm = max(0.0, marks - pmarks)
+                dt = max(0.0, total - ptotal)
+                prev[s] = (marks, total)
+                # ratio of CE-marked packets among this poll's egress traffic
+                ecn[s] = min(1.0, dm / dt) if dt > 0 else 0.0
             with open('/tmp/ecn_global.json', 'w') as f:
                 _json.dump(ecn, f)
         except Exception:
@@ -228,7 +242,24 @@ def main():
     cleanup()
     time.sleep(0.5)
 
+    # controlled experiment entry points (avoid full pipeline retraining):
+    #   --cc [nrep]        : build topology then run compare_cc only
+    #   --ablate <stage>   : build topology then run one resilience ablation
+    #   --ablate-all       : run all 4 ablation stages (0..3)
+    argv = [a for a in sys.argv]
+    cc_mode = '--cc' in argv
+    ablate_mode = None
+    ablate_all = '--ablate-all' in argv
+    for i, a in enumerate(argv):
+        if a == '--ablate' and i + 1 < len(argv):
+            ablate_mode = int(argv[i + 1])
+    cc_rep = 5
+    for i, a in enumerate(argv):
+        if a == '--cc' and i + 1 < len(argv) and argv[i + 1].isdigit():
+            cc_rep = int(argv[i + 1])
+
     import flow_mptcp as fmod
+    import json as _json_main
 
     # ---- 1. Build connection graph (3~4 subflows, first direct) ----
     print '=== 1. Build MPTCP connection graph ==='
@@ -387,6 +418,30 @@ def main():
             'ip netns exec {} ping -c 2 -W 1 {}'.format(NS(src), dst_host),
             shell=True)
         print '  direct ping rc:', out
+
+    # ---- controlled experiments: --cc / --ablate skip the demo pipeline ----
+    results_dir = os.path.join(_HERE, 'results')
+    if cc_mode:
+        demo_flows = [f for f in flows if len(f.subflows) >= 3][:3]
+        compare_cc(demo_flows, pairs, direct_links, n_rep=cc_rep,
+                   results_out=os.path.join(results_dir, 't5_cc.json'))
+        print '\n=== Done (--cc, topology up) ==='
+        print 'Ctrl-C to cleanup.'
+        return
+    if ablate_mode is not None or ablate_all:
+        stages = [ablate_mode] if ablate_mode is not None else [0, 1, 3, 15]
+        agg = []
+        for st in stages:
+            r = ablate_resilience(
+                flows, pairs, direct_links, stage=st,
+                results_out=os.path.join(results_dir,
+                                         'fig8_stage%d.json' % st))
+            agg.append(r)
+        with open(os.path.join(results_dir, 'fig8_ablation.json'), 'w') as f:
+            _json_main.dump(agg, f, indent=1)
+        print '\n=== Done (--ablate, topology up) ==='
+        print 'Ctrl-C to cleanup.'
+        return
 
     # ---- 9. M3/M4: multi-subflow send with SSN, reorder by DSN ----
     print '\n=== 9. M3/M4: multi-subflow SSN send + DSN reorder ==='
@@ -682,11 +737,17 @@ def demo_3domain():
     print '  [*] direct subflows keep rate (DCQCN only cuts switch subflows)'
 
 
-def compare_cc(demos, pairs, direct_links, run_seconds=8):
-    """Congestion-control comparison (T5): RL-cwnd vs fixed cwnd vs pseudo-Reno
-    (AIMD) over the same concurrent MPTCP flows; prints per-flow throughput and
-    fairness (Jain's index) for the paper's baseline data."""
+def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
+               credit_limit=128, pace=0.0002, results_out=None):
+    """Congestion-control comparison (T5): RL vs MPTCP LIA/OLIA vs fixed cwnd
+    vs pseudo-Reno (AIMD) over the same concurrent MPTCP flows. Each mode is
+    run n_rep times (fresh receiver ports per rep, topology not rebuilt) and
+    per-flow throughput is reported as mean +/- std; Jain's index is computed
+    from the per-flow means. Results are dumped to results_out (JSON) so the
+    figure script reads real data instead of hardcoded values."""
     import mptcp_tcp
+    import re as _re
+    import json as _json
     _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
     def sw_ip(i, s):
         return '{}.{}'.format(_SW_NET[s], i)
@@ -695,82 +756,246 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8):
              ('olia', 'MPTCP OLIA'),
              ('fixed', 'Fixed cwnd=32'),
              ('aimd', 'Pseudo-Reno (AIMD)')]
-    print '\n=== 13. Congestion-control comparison (T5) ==='
-    results = {}
-    for mi, (mode, label) in enumerate(modes):
-        base_port = 8000 + mi * 10
-        receivers, senders = [], []
-        for fi, demo in enumerate(demos):
-            port = base_port + fi
-            n_sub = len(demo.subflows)
-            recv_body = (
-                'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-                'import mptcp_tcp\n'
-                'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=%d)\n'
-                'o = r.recv_loop(%d)\n'
-                'print "OK", r.stats()\n'
-            ) % (port, n_sub, run_seconds + 5, run_seconds + 5)
-            with open('/tmp/cc_recv_%d_%d.py' % (mi, fi), 'w') as f:
-                f.write(recv_body)
-            rp = subprocess.Popen(
-                'ip netns exec {} python2 -u /tmp/cc_recv_%d_%d.py'.format(NS(demo.dst)) % (mi, fi),
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            receivers.append((demo, rp, port))
-            send_dest = []
-            for k, sf in enumerate(demo.subflows):
-                if sf.path == 'direct':
-                    dlink = direct_links[sf.sid]
-                    ipb = dlink[3].split('/')[0]
-                else:
-                    sw_idx = int(sf.path[2]) - 1
-                    ipb = sw_ip(demo.dst, sw_idx + 1)
-                send_dest.append((ipb, k, sf.path))
-            stopf = '/tmp/cc_stop_%d_%d' % (mi, demo.fid)
-            try:
-                os.remove(stopf)
-            except Exception:
-                pass
-            snd_body = (
-                'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
-                'import mptcp_tcp\n'
-                'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, cc_mode=%r)\n'
-                'g.run_loop(stop_file=%r)\n'
-            ) % (demo.fid, send_dest, port, POLICY_REAL, mode, stopf)
-            with open('/tmp/cc_send_%d_%d.py' % (mi, fi), 'w') as f:
-                f.write(snd_body)
-            sp = subprocess.Popen(
-                'ip netns exec {} python2 -u /tmp/cc_send_%d_%d.py'.format(NS(demo.src)) % (mi, fi),
-                shell=True, preexec_fn=os.setsid,
-                stdout=open('/tmp/cc_send_%d_%d.out' % (mi, fi), 'w'),
-                stderr=subprocess.STDOUT)
-            senders.append((demo, sp, stopf))
-        time.sleep(1)
-        time.sleep(run_seconds)
-        for demo, sp, stopf in senders:
-            try:
-                with open(stopf, 'w'):
-                    pass
-                sp.wait(timeout=6)
-            except Exception:
+    n_modes = len(modes)
+    print '\n=== 13. Congestion-control comparison (T5): %d modes x %d reps ===' % (
+        n_modes, n_rep)
+    # mode -> {rep: [per-flow thpt]}
+    per_rep = {mode: [] for mode, _ in modes}
+    dropped = {}   # mode -> count of reps dropped as outliers
+    for rep in range(n_rep):
+        for mi, (mode, label) in enumerate(modes):
+            base_port = 8000 + (rep * n_modes + mi) * 10   # fresh ports per rep
+            receivers, senders = [], []
+            for fi, demo in enumerate(demos):
+                port = base_port + fi
+                n_sub = len(demo.subflows)
+                recv_body = (
+                    'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                    'import mptcp_tcp\n'
+                    'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=%d)\n'
+                    'o = r.recv_loop(%d)\n'
+                    'print "OK", r.stats()\n'
+                ) % (port, n_sub, run_seconds + 5, run_seconds + 5)
+                with open('/tmp/cc_recv_%d_%d_%d.py' % (rep, mi, fi), 'w') as f:
+                    f.write(recv_body)
+                rp = subprocess.Popen(
+                    'ip netns exec {} python2 -u /tmp/cc_recv_%d_%d_%d.py'.format(
+                        NS(demo.dst)) % (rep, mi, fi),
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                receivers.append((demo, rp))
+                send_dest = []
+                for k, sf in enumerate(demo.subflows):
+                    if sf.path == 'direct':
+                        dlink = direct_links[sf.sid]
+                        ipb = dlink[3].split('/')[0]
+                    else:
+                        sw_idx = int(sf.path[2]) - 1
+                        ipb = sw_ip(demo.dst, sw_idx + 1)
+                    send_dest.append((ipb, k, sf.path))
+                stopf = '/tmp/cc_stop_%d_%d_%d' % (rep, mi, demo.fid)
                 try:
-                    os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
+                    os.remove(stopf)
                 except Exception:
                     pass
-        time.sleep(3)
-        import re as _re
-        thpt = []
-        for demo, rp, port in receivers:
-            out = rp.stdout.read()
-            m = _re.search(r"'ordered': (\d+)", out)
-            ordered = int(m.group(1)) if m else 0
-            thpt.append(ordered / float(run_seconds))
-        n = len(thpt)
-        jain = ((sum(thpt) ** 2) / (n * sum(x * x for x in thpt))) \
-            if n and sum(thpt) else 0.0
-        results[mode] = (thpt, jain)
-        print '  %-24s thpt=%s seg/s  jain=%.3f' % (
-            label, ['%.1f' % t for t in thpt], jain)
+                snd_body = (
+                    'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                    'import mptcp_tcp\n'
+                    'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, '
+                    'cc_mode=%r, credit_limit=%d, pace=%r)\n'
+                    'g.run_loop(stop_file=%r)\n'
+                ) % (demo.fid, send_dest, port, POLICY_REAL, mode,
+                     credit_limit, pace, stopf)
+                with open('/tmp/cc_send_%d_%d_%d.py' % (rep, mi, fi), 'w') as f:
+                    f.write(snd_body)
+                sp = subprocess.Popen(
+                    'ip netns exec {} python2 -u /tmp/cc_send_%d_%d_%d.py'.format(
+                        NS(demo.src)) % (rep, mi, fi),
+                    shell=True, preexec_fn=os.setsid,
+                    stdout=open('/tmp/cc_send_%d_%d_%d.out' % (rep, mi, fi), 'w'),
+                    stderr=subprocess.STDOUT)
+                senders.append((demo, sp, stopf))
+            time.sleep(1)
+            time.sleep(run_seconds)
+            for demo, sp, stopf in senders:
+                try:
+                    with open(stopf, 'w'):
+                        pass
+                    sp.wait(timeout=6)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
+                    except Exception:
+                        pass
+            time.sleep(3)
+            thpt = []
+            for demo, rp in receivers:
+                out = rp.stdout.read()
+                m = _re.search(r"'ordered': (\d+)", out)
+                ordered = int(m.group(1)) if m else 0
+                thpt.append(ordered / float(run_seconds))
+            per_rep[mode].append(thpt)
+            n = len(thpt)
+            jain = ((sum(thpt) ** 2) / (n * sum(x * x for x in thpt))) \
+                if n and sum(thpt) else 0.0
+            print '  [rep %d] %-24s thpt=%s seg/s  jain=%.3f' % (
+                rep, label, ['%.1f' % t for t in thpt], jain)
+    # ---- aggregate: per-flow mean/std over reps, Jain from means ----
+    import math as _math
+    results = {}
+    for mode, label in modes:
+        reps = [r for r in per_rep[mode] if r]
+        n_flow = len(reps[0])
+        # drop outlier reps (any flow < 50% of the median across reps)
+        med = [sorted(r[i] for r in reps)[len(reps) // 2] for i in range(n_flow)]
+        keep = [r for r in reps
+                if all(r[i] >= 0.5 * med[i] for i in range(n_flow))]
+        dropped[mode] = len(reps) - len(keep)
+        if not keep:
+            keep = reps
+        means = [sum(r[i] for r in keep) / float(len(keep))
+                 for i in range(n_flow)]
+        stds = [_math.sqrt(sum((r[i] - means[i]) ** 2 for r in keep)
+                           / float(len(keep))) for i in range(n_flow)]
+        s = sum(means)
+        jain = (s * s) / (n_flow * sum(m * m for m in means)) \
+            if s else 0.0
+        results[mode] = {
+            'label': label,
+            'per_rep': per_rep[mode],
+            'n_rep_used': len(keep),
+            'n_rep_dropped': dropped[mode],
+            'mean': means, 'std': stds, 'jain': jain,
+        }
+        print '  %-24s mean=%s +- %s seg/s  jain=%.4f  (used %d/%d reps)' % (
+            label, ['%.2f' % m for m in means], ['%.2f' % v for v in stds],
+            jain, len(keep), len(reps))
+    if results_out:
+        try:
+            os.makedirs(os.path.dirname(results_out))
+        except Exception:
+            pass
+        with open(results_out, 'w') as f:
+            _json.dump(results, f, indent=1)
+        print '  [cc] results written to', results_out
     return results
+
+
+def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
+                      results_out=None, n_rep=3):
+    """Controlled resilience ablation (paper Fig. 8): the same cut/up script
+    is replayed under progressively enabled recovery layers, and the receiver
+    reports (ordered, dup, in_buf). stage bitmask over
+    {1: go-back-N replay, 2: NAK/SACK, 4: stall-detect, 8: tail-converge};
+    stage 0 = no app-layer recovery, stage 15 = all layers."""
+    import mptcp_tcp
+    import json as _json
+    import re as _re
+    _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    def sw_ip(i, s):
+        return '{}.{}'.format(_SW_NET[s], i)
+    stages_map = {
+        0: {'replay': 0, 'nak': 0, 'stall': 0, 'tail': 0},
+        1: {'replay': 1, 'nak': 0, 'stall': 0, 'tail': 0},
+        3: {'replay': 1, 'nak': 1, 'stall': 0, 'tail': 0},
+        15: {'replay': 1, 'nak': 1, 'stall': 1, 'tail': 1},
+    }
+    name = {0: 'stage0-no-recovery', 1: 'stage1-replay',
+            3: 'stage2-nak', 15: 'stage3-full'}[stage]
+    print '\n=== Resilience ablation: %s ===' % name
+    demo = [f for f in flows if len(f.subflows) >= 3][0]
+    n_sub = len(demo.subflows)
+    # drop target: the switch subflow with the largest RTT (sw2=30ms > sw1
+    # 10ms > sw3 2ms) so it holds the most in-flight data at drop time
+    rtt = {'direct': 1.0, 'sw1': 10.0, 'sw2': 30.0, 'sw3': 2.0}
+    sw_sfs = [(k, sf) for k, sf in enumerate(demo.subflows)
+              if sf.path.startswith('sw')]
+    drop_sid = sorted(sw_sfs, key=lambda (k, sf): -rtt[sf.path])[0][0]
+    print '  demo flow %d -> %s, drop sid=%d (%s)' % (
+        demo.fid, [sf.path for sf in demo.subflows], drop_sid,
+        demo.subflows[drop_sid].path)
+    send_dest = []
+    for k, sf in enumerate(demo.subflows):
+        if sf.path == 'direct':
+            dlink = direct_links[sf.sid]
+            ipb = dlink[3].split('/')[0]
+        else:
+            sw_idx = int(sf.path[2]) - 1
+            ipb = sw_ip(demo.dst, sw_idx + 1)
+        send_dest.append((ipb, k, sf.path))
+    res = {'stage': stage, 'name': name, 'per_rep': []}
+    for rep in range(n_rep):
+        port = 9000 + stage * 10 + rep
+        recv_body = (
+            'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+            'import mptcp_tcp\n'
+            'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=%d)\n'
+            'o = r.recv_loop(%d)\n'
+            'print "OK", r.stats()\n'
+        ) % (port, n_sub, run_seconds + 8, run_seconds + 8)
+        with open('/tmp/abl_recv_%d_%d.py' % (stage, rep), 'w') as f:
+            f.write(recv_body)
+        rp = subprocess.Popen(
+            'ip netns exec {} python2 -u /tmp/abl_recv_%d_%d.py'.format(
+                NS(demo.dst)) % (stage, rep),
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stopf = '/tmp/abl_stop_%d_%d' % (stage, rep)
+        try:
+            os.remove(stopf)
+        except Exception:
+            pass
+        snd_body = (
+            'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+            'import mptcp_tcp\n'
+            'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, '
+            'cc_mode=%r, fixed_cwnd=%d, credit_limit=%d, pace=%r, stages=%r, '
+            'round_robin=True, auto_drop_sid=%d, auto_drop_at=%r)\n'
+            'g.run_loop(stop_file=%r)\n'
+        ) % (demo.fid, send_dest, port, POLICY_REAL, 'fixed',
+             300, 300, 0.0002, stages_map[stage], drop_sid, 3.0, stopf)
+        with open('/tmp/abl_send_%d_%d.py' % (stage, rep), 'w') as f:
+            f.write(snd_body)
+        sp = subprocess.Popen(
+            'ip netns exec {} python2 -u /tmp/abl_send_%d_%d.py'.format(
+                NS(demo.src)) % (stage, rep),
+            shell=True, preexec_fn=os.setsid,
+            stdout=open('/tmp/abl_send_%d_%d.out' % (stage, rep), 'w'),
+            stderr=subprocess.STDOUT)
+        # deterministic lifecycle: sender drops subflow sid=1 at t=3s; let the
+        # enabled recovery layers (if any) fill the gap, then stop at t=run.
+        time.sleep(run_seconds)
+        try:
+            with open(stopf, 'w'):
+                pass
+            sp.wait(timeout=8)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        out = rp.stdout.read()
+        m = _re.search(r"'ordered': (\d+).*?'dup': (\d+).*?'in_buf': (\d+)",
+                       out, _re.S)
+        ordered = int(m.group(1)) if m else 0
+        dup = int(m.group(2)) if m else 0
+        in_buf = int(m.group(3)) if m else -1
+        res['per_rep'].append({'ordered': ordered, 'dup': dup, 'in_buf': in_buf})
+        print '  [abl rep %d] ordered=%d dup=%d in_buf=%d' % (
+            rep, ordered, dup, in_buf)
+    n = len(res['per_rep'])
+    res['mean'] = {
+        'ordered': sum(r['ordered'] for r in res['per_rep']) / float(n),
+        'dup': sum(r['dup'] for r in res['per_rep']) / float(n),
+        'in_buf': sum(r['in_buf'] for r in res['per_rep']) / float(n),
+    }
+    if results_out:
+        try:
+            os.makedirs(os.path.dirname(results_out))
+        except Exception:
+            pass
+        with open(results_out, 'w') as f:
+            _json.dump(res, f, indent=1)
+        print '  [abl] written to', results_out
+    return res
 
 
 def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):

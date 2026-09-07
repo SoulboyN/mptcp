@@ -67,6 +67,8 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 | 对比实验 T5 | `compare_cc`:RL-cwnd vs MPTCP LIA vs OLIA vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 5 模式全健康(RL jain 0.997,OLIA 1.000);修复"第三条流塌缩"缺陷 |
 | 第三条流修复 | 发送器窗口水位耦合于按序 `next_dsn` → 乱序缺口冻结整条连接;改为按接收方**去重接收水位** `recv_total` 释放窗口;重传优先最空闲子流 | 修复后同一次运行仍出现子流 connect failed 但不再卡死(0.1→87 seg/s) |
 | MPTCP 标准基线 | `cc_mode='lia'/'olia'`:RFC 6356 耦合拥塞控制(`alpha=cwnd_total·max(cwnd/rtt²)/(Σ cwnd/rtt)²`);LIA/OLIA 在同一应用层框架实现,与残差 RL 苹果对苹果 | 实测聚合吞吐 RL 86.6 / LIA 85.4 / OLIA 87.0 seg/s,同一水平;OLIA 最均衡 |
+| 去 pacing + 可重复 T5 | `run_loop` 窗口忙发(去 10ms 上限)、`credit_limit` 参数化、CC step 由 NAK 反馈驱动、`ecn_collector` 改 Δmarks/Δtotal 差分、compare_cc 支持 `--cc N`(N 次重复 mean±std 落 JSON) | 去 pacing 后 CC 区分显现:Fixed 156-208 / AIMD 110-144 / LIA-OLIA 76-104 / RL 42-64 seg/s(RL 响应交换机 ECN 拥塞故低) |
+| 断链受控消融 | `--ablate-all`:逐层启用恢复(go-back-N/NAK/stall/tail),drop 最慢交换机子流,测 ordered/dup/in_buf;确定性(round-robin + 禁重连 + linger RST) | 无恢复 in_buf≈7.5k/ordered 低 → 任一恢复层 in_buf=0/ordered 近满 |
 | 动态子流管理 | `add_subflow`/`remove_subflow` + cmd_file 控制通道(模拟 ADD_ADDR/REMOVE_ADDR);sender 状态导出应用层 SSN(DSS 映射轴) | 单测:动态加 sw3、移 sw1,in_buf 0 按序 |
 | 残差 RL + 量化 | DCQCN 基线 + **5 档量化状态** + **5 档残差动作**{×0.5/0.75/1.0/1.25/1.5}:`cwnd=clamp(基线×残差)`;RL 只学"比局部机制更激进/保守" | 离线学到[1.0,1.25,1.5,0.5,0.5](低拥塞吃满带宽、高拥塞保守);部署单测通过 |
 
@@ -84,5 +86,5 @@ docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --
 ## 待办
 
 - 交互/--demo 接线动态 add/remove 命令(core 机制已通)
-- 发送循环 10ms 调度上限(~100 seg/s)限制 CC 区分度,需提高发送速率上限后重测
 - policy_mptcp_real.json 已随完整实验重训为 5 级残差(当前 [1.0,1.25,1.5,0.5,0.5])
+- T5 结果(去 pacing 后)显示 RL 因响应交换机 ECN 拥塞而吞吐最低——论文 7.3 以"接受并讨论"口径处理

@@ -204,7 +204,8 @@ class TcpSsnSender(object):
     send/recv counts, RL-set cwnd, receiver-granted credit cap. The RL
     scheduler and the sender's window check drive these fields."""
 
-    def __init__(self, dst_ip, port, subflow_id, sid_int=0, path='direct'):
+    def __init__(self, dst_ip, port, subflow_id, sid_int=0, path='direct',
+                 cwnd=16, credit_limit=20):
         self.dst_ip = dst_ip
         self.port = port
         self.sid = subflow_id
@@ -216,8 +217,8 @@ class TcpSsnSender(object):
         # app-layer window state (SSN/credit axis)
         self.send_count = 0        # new DSNs sent on this subflow (stats)
         self.recv_count = 0        # receiver-reported received count (stats)
-        self.cwnd = 16             # RL-set in-flight cap
-        self.credit_limit = 20     # receiver-granted in-flight cap (ssn_credit_grant)
+        self.cwnd = cwnd           # RL-set in-flight cap
+        self.credit_limit = credit_limit  # receiver-granted in-flight cap
         self.assigned = []         # DSNs assigned here not yet ordered by recv
         self.recent = []           # recent DSNs for go-back-N replay
 
@@ -267,13 +268,28 @@ class MptcpGroupSender(object):
     PATH_RTT = {'direct': 1.0, 'sw1': 10.0, 'sw2': 30.0, 'sw3': 2.0}
 
     def __init__(self, flow_id, dests, port, retry_interval=2.0, control_port=None,
-                 policy_path=None, cc_mode='rl', fixed_cwnd=32):
+                 policy_path=None, cc_mode='rl', fixed_cwnd=32,
+                 credit_limit=20, pace=0.01, cc_period=0.3,
+                 stages=None, round_robin=False,
+                 auto_drop_sid=None, auto_drop_at=None):
         # dests: list of (dst_ip, sid_int, path)
         self.flow_id = flow_id
         self.port = port
         self.control_port = control_port or port
-        self.cc_mode = cc_mode              # 'rl' | 'fixed' | 'aimd'
+        self.cc_mode = cc_mode              # 'rl' | 'fixed' | 'lia' | 'olia' | 'aimd'
         self.fixed_cwnd = fixed_cwnd
+        self.credit_limit = credit_limit    # receiver-granted in-flight cap
+        self.pace = pace                    # run_loop poll when window full (s)
+        self.cc_period = cc_period          # CC scheduling period (s)
+        self.round_robin = round_robin      # ablation: pick subflows in turn
+        self.auto_drop_sid = auto_drop_sid  # ablation: sid to kill at auto_drop_at
+        self.auto_drop_at = auto_drop_at    # seconds after run_loop start
+        self._dropped_auto = False
+        self.no_reconnect = set()           # sids held down by the ablation
+        # resilience-layer switches for the ablation study (stage0..stage3)
+        self.stages = {'replay': 1, 'nak': 1, 'stall': 1, 'tail': 1}
+        if stages:
+            self.stages.update(stages)
         self.senders = []              # live subflow sockets
         self.dead = []                 # (dst_ip, sid_int, path) awaiting reconnect
         self.retry_interval = retry_interval
@@ -288,6 +304,11 @@ class MptcpGroupSender(object):
         self._prev_send = {}           # sid_int -> send_count at last CC step
         self._rl_counter = 0
         self._rl_state = 0
+        self._rr = 0
+        self._last_cc_t = time.time()
+        self._last_cc_print = 0.0      # throttle CC console prints
+        self._recv_epoch = 0           # bumped each NAK response received
+        self._cc_epoch_done = -1       # last CC step's recv_epoch
         for ipb, sid, path in dests:
             s = self._connect(ipb, sid, path)
             if s is None:
@@ -307,7 +328,8 @@ class MptcpGroupSender(object):
     def _connect(self, ipb, sid, path='direct'):
         try:
             return TcpSsnSender(ipb, self.port, '%d.%d' % (self.flow_id, sid),
-                                sid_int=sid, path=path)
+                                sid_int=sid, path=path,
+                                cwnd=16, credit_limit=self.credit_limit)
         except Exception:
             return None
 
@@ -374,12 +396,17 @@ class MptcpGroupSender(object):
                         if s.assigned:
                             s.assigned = [d for d in s.assigned
                                           if d >= self._recv_total]
-                self._check_stalls(rcv)
                 with self._lock:
+                    # deltas must be computed against the PREVIOUS poll's
+                    # _last_rcv; _check_stalls below replaces _last_rcv with the
+                    # current rcv, so do this first.
                     self._recv_deltas = {
                         sid: cnt - self._last_rcv.get(sid, 0)
                         for sid, cnt in rcv.items()}
-                if nxt < maxd:
+                self._check_stalls(rcv)
+                with self._lock:
+                    self._recv_epoch += 1
+                if self.stages.get('nak', 1) and nxt < maxd:
                     self._retransmit_range(nxt, maxd)
                 break
 
@@ -413,7 +440,11 @@ class MptcpGroupSender(object):
         """Drop live subflows that delivered nothing new since the last poll
         while the sender is STILL feeding them (their DSNs are being silently
         swallowed by a dead connection). A subflow with no in-flight data is
-        just window-throttled by RL/cwnd -- it must NOT be flagged."""
+        just window-throttled by RL/cwnd -- it must NOT be flagged. Gated by
+        the 'stall' stage for the resilience ablation study."""
+        if not self.stages.get('stall', 1):
+            self._last_rcv = dict(rcv)
+            return
         with self._lock:
             live = list(self.senders)
         for s in live:
@@ -483,8 +514,9 @@ class MptcpGroupSender(object):
         print '  [sender] subflow %d lost; %d still up' % (
             s.sid_int, len(self.senders))
         # replay the subflow's in-flight window (its data may have been
-        # sitting in the kernel TCP buffer and lost on the RST)
-        if recent:
+        # sitting in the kernel TCP buffer and lost on the RST). Gated by the
+        # 'replay' stage for the resilience ablation study.
+        if self.stages.get('replay', 1) and recent:
             n = 0
             for dsn in recent:
                 if self._retransmit(dsn):
@@ -492,6 +524,14 @@ class MptcpGroupSender(object):
                 time.sleep(self.NAK_PACE)
             print '  [sender]   replayed %d in-flight DSN(s) of subflow %d' % (
                 n, s.sid_int)
+        # ablated subflows stay down (no reconnect) so the recovery layers
+        # must actively fill the gap, not wait for the path to come back
+        if self.auto_drop_sid is not None and s.sid_int == self.auto_drop_sid:
+            try:
+                self.dead.remove((s.dst_ip, s.sid_int, s.path))
+            except Exception:
+                pass
+            self.no_reconnect.add(s.sid_int)
 
     def _try_reconnect(self):
         with self._lock:
@@ -499,8 +539,13 @@ class MptcpGroupSender(object):
                 return
             if time.time() - self._last_retry < self.retry_interval:
                 return
+            # reconnect only subflows NOT held down by the ablation
+            candidates = [d for d in self.dead if d[1] not in self.no_reconnect]
+            if not candidates:
+                return
             self._last_retry = time.time()
-            ipb, sid, path = self.dead.pop(0)
+            ipb, sid, path = candidates.pop(0)
+            self.dead.remove((ipb, sid, path))
         s = self._connect(ipb, sid, path)
         if s is not None:
             with self._lock:
@@ -516,9 +561,23 @@ class MptcpGroupSender(object):
         the chosen subflow fails, retransmit on a healthy one. Returns True
         if a subflow accepted it."""
         self._try_reconnect()
+        now = time.time()
         self._rl_counter += 1
-        if self._rl_counter % 20 == 0:
-            self._rl_step()
+        if self.cc_mode == 'rl':
+            # time-based: RL reads the global ECN view, refreshed independently
+            if now - self._last_cc_t >= self.cc_period:
+                self._last_cc_t = now
+                self._rl_step()
+        else:
+            # loss-based CC (lia/olia/aimd) must not step faster than the NAK
+            # feedback loop: _recv_deltas refreshes once per NAK poll, and a
+            # step between polls sees sent>0 but recv_delta=0 -> spurious
+            # "congestion" that halves cwnd to the floor.
+            with self._lock:
+                ep = self._recv_epoch
+            if ep != self._cc_epoch_done:
+                self._cc_epoch_done = ep
+                self._rl_step()
         with self._lock:
             if not self.senders:
                 return False
@@ -538,7 +597,17 @@ class MptcpGroupSender(object):
 
     def _pick_subflow(self, live):
         """Prefer the RL-preferred (lowest pressure) subflow, skipping any
-        whose window is full (cwnd or receiver-credit cap)."""
+        whose window is full (cwnd or receiver-credit cap). In round-robin
+        mode (used by the resilience ablation) subflows are picked in turn so
+        every path carries data and a path cut actually strands in-flight
+        DSNs."""
+        if self.round_robin:
+            for _ in range(len(live)):
+                s = live[self._rr % len(live)]
+                self._rr += 1
+                if s.can_send():
+                    return s
+            return None
         weights = self.scheduler.path_weights()
         for sf in sorted(live, key=lambda sf: -weights.get(sf.sid, 0.0)):
             if sf.can_send():
@@ -563,7 +632,7 @@ class MptcpGroupSender(object):
             if self.cc_mode == 'fixed':
                 for sf in list(self.senders):
                     sf.cwnd = self.fixed_cwnd
-                print '  [cc] fixed cwnd=%d' % self.fixed_cwnd
+                self._dbg('  [cc] fixed cwnd=%d' % self.fixed_cwnd)
             elif self.cc_mode in ('lia', 'olia'):
                 state = self._cc_lia_step()
             elif self.cc_mode == 'aimd':
@@ -573,8 +642,8 @@ class MptcpGroupSender(object):
                     per_sub = dict(self._recv_counts)
                 state, cwnds, _ = self.scheduler.step(sw_ecn, per_sub)
                 self._rl_state = state
-                print '  [rl] state=%d cwnd=%s' % (
-                    state, {k: int(v) for k, v in cwnds.items()})
+                self._dbg('  [rl] state=%d cwnd=%s' % (
+                    state, {k: int(v) for k, v in cwnds.items()}))
             with self._lock:
                 live = list(self.senders)
             try:
@@ -596,6 +665,14 @@ class MptcpGroupSender(object):
                 pass
         except Exception as e:
             print '  [cc] step failed: %s' % e
+
+    def _dbg(self, msg):
+        """Throttled console print for per-step CC messages (they fire every
+        cc_period when pacing is removed; printing every step floods logs)."""
+        now = time.time()
+        if now - self._last_cc_print >= 2.0:
+            self._last_cc_print = now
+            print msg
 
     def _cc_lia_step(self):
         """MPTCP LIA / OLIA coupled congestion control (RFC 6356).
@@ -634,8 +711,8 @@ class MptcpGroupSender(object):
             if self.cc_mode == 'olia' and share(s) >= best_share - 1e-9:
                 inc = max(inc, 1.0 / cw[sid])           # best-path boost
             s.cwnd = min(128.0, s.cwnd + inc)
-        print '  [cc] %s cwnd=%s' % (
-            self.cc_mode, {s.sid_int: int(s.cwnd) for s in live})
+        self._dbg('  [cc] %s cwnd=%s' % (
+            self.cc_mode, {s.sid_int: int(s.cwnd) for s in live}))
         return 2 if congested else (1 if any(s.cwnd > 20 for s in live) else 0)
 
     def _cc_aimd_step(self):
@@ -657,7 +734,7 @@ class MptcpGroupSender(object):
                 congested += 1
             else:
                 s.cwnd = min(64, int(s.cwnd) + 1)
-        print '  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in live}
+        self._dbg('  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in live})
         return 2 if congested else (1 if any(s.cwnd > 20 for s in live) else 0)
 
     def run_loop(self, stop_file=None, settle=3.0, cmd_file=None):
@@ -668,12 +745,40 @@ class MptcpGroupSender(object):
         (Replaces a hard SIGTERM kill, which truncated the tail -> in_buf.)
         If cmd_file is given, it is a control channel for dynamic subflow
         management (MPTCP ADD_ADDR / REMOVE_ADDR simulation): lines like
-        'add <sid> <dst_ip> <path>' or 'remove <sid>' are executed."""
+        'add <sid> <dst_ip> <path>' or 'remove <sid>' are executed.
+        DSN advances only when a subflow accepted it (no holes when the window
+        is full); when all windows are full we poll at self.pace so the send
+        rate is governed by in_flight < min(cwnd, credit), not a fixed timer."""
         dsn = 0
+        _t0 = time.time()
         try:
             while True:
                 if stop_file and os.path.exists(stop_file):
                     break
+                # ablation: kill a subflow at a fixed time to simulate a path
+                # drop (its in-flight window is recovered only if the replay/
+                # nak/tail layers are enabled for this stage)
+                if (self.auto_drop_sid is not None and not self._dropped_auto
+                        and time.time() - _t0 >= self.auto_drop_at):
+                    self._dropped_auto = True
+                    with self._lock:
+                        tgt = next((s for s in self.senders
+                                    if s.sid_int == self.auto_drop_sid), None)
+                    if tgt is not None:
+                        # force RST (linger=0) so in-flight data in the kernel
+                        # buffer is genuinely lost, like a real path drop;
+                        # a graceful close() would drain it and hide the gap
+                        try:
+                            import struct as _st
+                            tgt.sock.setsockopt(
+                                socket.SOL_SOCKET, socket.SO_LINGER,
+                                _st.pack('ii', 1, 0))
+                        except Exception:
+                            pass
+                        self._drop(tgt)
+                        print '  [abl] dropped subflow %d (t=%.1fs, assigned=%d)' % (
+                            self.auto_drop_sid, time.time() - _t0,
+                            len(getattr(tgt, 'assigned', [])))
                 if cmd_file and os.path.exists(cmd_file):
                     try:
                         with open(cmd_file) as _f:
@@ -683,12 +788,13 @@ class MptcpGroupSender(object):
                             self._exec_cmd(line)
                     except Exception:
                         pass
-                self.send_next(dsn)
-                dsn += 1
-                time.sleep(0.01)
+                if self.send_next(dsn):
+                    dsn += 1
+                else:
+                    time.sleep(self.pace)
         except KeyboardInterrupt:
             pass
-        if stop_file:
+        if stop_file and self.stages.get('tail', 1):
             deadline = time.time() + settle
             while time.time() < deadline:
                 with self._lock:
