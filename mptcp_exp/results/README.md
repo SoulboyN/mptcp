@@ -1,6 +1,6 @@
 # 正式实验结果索引
 
-这里只保留当前论文使用的正式结果。历史快照、pilot、运行日志和逐进程临时输出未纳入仓库。
+这里只保留当前正式实验结果。历史快照、pilot、运行日志和逐进程临时输出未纳入仓库。
 
 ## 用户态原型
 
@@ -10,9 +10,9 @@
 | `dynamic_adaptation.json` | 无 RL 与残差 Q 的三阶段动态实验，每模式 3 次 |
 | `fig8_stage{0,1,3,15}.json` | 四级故障恢复消融的逐轮结果 |
 | `fig8_ablation.json` | 修正后的故障恢复汇总 |
-| `paper_evidence/paper_evidence_summary.json` | 论文主证据的均值、标准差和 95% t 区间 |
+| `paper_evidence/paper_evidence_summary.json` | 实验汇总的均值、标准差和 95% t 区间 |
 | `paper_evidence/source_data_paper.csv` | 可复核长表 |
-| `paper_evidence/fig_paper_evidence.{png,svg,pdf}` | 论文主证据图 |
+| `paper_evidence/fig_paper_evidence.{png,svg,pdf}` | 实验汇总图（目录与文件沿用既有命名） |
 
 ## Linux 原生 MPTCP 参考
 

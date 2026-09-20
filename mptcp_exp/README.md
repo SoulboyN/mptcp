@@ -17,7 +17,7 @@
 | `simple_router_global.p4` | P4 转发、ECN 标记和计量 |
 | `policy_mptcp_real.json` | 正式实验使用的残差策略 |
 | `analyze_paper_results.py` | 生成原型统计汇总和 Source Data |
-| `make_paper_evidence_figure.py` | 生成论文主证据图 |
+| `make_paper_evidence_figure.py` | 生成实验汇总图（沿用既有文件名） |
 | `run_native_reference.py` | 原生 TCP/MPTCP 正式对照套件 |
 | `analyze_native_reference.py` | 生成原生参考统计和 Source Data |
 | `prepare_native_vm.sh` | 准备原生 MPTCP 虚拟机环境 |
@@ -57,4 +57,4 @@ python3 mptcp_exp/make_paper_evidence_figure.py
 python3 mptcp_exp/analyze_native_reference.py
 ```
 
-图形 QA 由 `audit_panel_alignment.py` 生成。仓库保存 PNG、SVG 和 PDF；投稿用 TIFF 可从矢量图重新导出。
+图形 QA 由 `audit_panel_alignment.py` 生成。仓库保存 PNG、SVG 和 PDF；TIFF 未纳入仓库，可从矢量图重新导出。

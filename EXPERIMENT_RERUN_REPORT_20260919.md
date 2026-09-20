@@ -1,6 +1,6 @@
-# MPTCP 修正实验与论文证据报告（更新至 2026-09-20）
+# MPTCP 修正实验结果报告（更新至 2026-09-20）
 
-> 本报告取代同名文件的早期版本。论文数字应只读取本报告列出的修正后 JSON、汇总 CSV 与图件，不得再使用历史快照。
+> 本报告汇总修正后的正式实验。结果解读应以本文列出的 JSON、汇总 CSV 与图件为准，不使用历史快照。
 
 ## 1. 本轮修复了什么
 
@@ -73,17 +73,7 @@
 
 所有数值均为 `n=5` 均值，无排除。replay 平均额外恢复 20 个唯一段，与 replay 窗口相符；NAK/SACK 使 5/5 次运行达到 800/800；完整主动尾部恢复同样达到 5/5 次完整交付，并相对 NAK-only 将 P95 均值降低约 34.6%，代价是更多重复段（25.2 对 8.2）。这支持的是**分层恢复的完整性—冗余—尾部时延权衡**，不是“零开销恢复”。
 
-## 6. 足以支撑的论文创新点
-
-1. **受约束且可审计的残差控制架构**：RL 不直接生成任意窗口，而是在 ECN/Credit 局部基线上从 5 个残差乘数中选择一个；5 状态 × 5 动作 Q 表可逐项检查，最坏行为受局部基线约束。
-2. **P4 全出口遥测到每子流控制的跨层闭环**：BMv2 数据面提供全出口、流量加权 ECN，控制面将其映射到连接级状态，再作用于异构子流窗口和路径分配。
-3. **拥塞控制与可靠性职责分离**：ECN、Credit、残差 Q、replay、NAK/SACK、stall/tail recovery 各自处理不同时间尺度和故障语义；消融展示了每层贡献及开销。
-4. **以 Pareto 工作点而非单指标胜负评价控制器**：实测表明保守残差策略显著牺牲吞吐并伴随较低时延，论文可据此讨论可配置服务目标，而不夸大为全面性能领先。
-5. **可复现的确定性路径故障方法**：固定工作量、确定 DSN 缺口、发送端出口黑洞、RST 阻止内核补传，并同时报告按序水位、唯一交付、缺失与重复，解决了旧实验“故障未真正形成缺口”的问题。
-
-最稳妥的论文定位是：**面向用户态 MPTCP 语义原型的、P4 遥测驱动的受约束残差控制与分层恢复系统论文**，而非 RL 算法优越性论文。
-
-## 7. 仍然存在的限制
+## 6. 仍然存在的限制
 
 1. 核心系统仍是 network namespace + BMv2 上的用户态 MPTCP 语义原型，不是把所提算法实现进 Linux MPTCP 内核；新增的原生 Linux MPTCP 实验仅作为独立外部参考。
 2. LIA、OLIA 与 Reno 是同一框架中的近似实现，只能称 LIA-inspired、OLIA-inspired 与 pseudo-Reno。
@@ -93,9 +83,9 @@
 6. ECN 遥测约 1 s 更新一次，而拥塞控制约 0.3 s 决策一次，快速变化下会重复使用旧观测。
 7. 当前证据不支持“吞吐更高”“微调有效”“原生 MPTCP 可部署”或“所有网络环境普遍有效”等表述。
 
-上述限制不妨碍架构与原型论文的核心论证，但阻止把论文写成 RL、原生协议或硬件性能优越性论文。
+这些限制意味着结果仅适用于当前原型、拓扑和测量口径，不能外推为算法或协议的普遍性能结论。
 
-## 8. 权威数据与图件
+## 7. 权威数据与图件
 
 - 拥塞控制原始重复：`mptcp_exp/results/t5_cc.json`
 - 动态实验原始重复：`mptcp_exp/results/dynamic_adaptation.json`
@@ -103,16 +93,12 @@
 - 修正后的故障汇总：`mptcp_exp/results/fig8_ablation.json`
 - 统计汇总：`mptcp_exp/results/paper_evidence/paper_evidence_summary.json`
 - 可复核长表：`mptcp_exp/results/paper_evidence/source_data_paper.csv`
-- 论文主证据图：`mptcp_exp/results/paper_evidence/fig_paper_evidence.{svg,pdf,png}`
+- 实验汇总图：`mptcp_exp/results/paper_evidence/fig_paper_evidence.{svg,pdf,png}`
 - 图形 QA：`fig_paper_evidence.alignment.json`、`fig_paper_evidence.collision-audit.json`
 
-建议图注：
+## 8. Linux 原生 MPTCP 独立参考实验（2026-09-20）
 
-> **图 X｜拥塞控制的吞吐—时延工作点、动态响应与路径故障恢复。** a，七种控制模式的三流总吞吐与 P95 接收时延；小点为独立运行，大点为均值，`n=5`。b–c，正常、高 ECN 与恢复阶段的吞吐和 direct 路径份额；线为均值，阴影为样本标准差，`n=3`。d，固定 800 段故障工作量下的缺失段与重复段；柱为均值，点为独立运行，`n=5`。所有重复均保留。
-
-## 9. Linux 原生 MPTCP 独立参考实验（2026-09-20）
-
-### 9.1 环境与设计
+### 8.1 环境与设计
 
 - Ubuntu 22.04 已迁移至 `F:\WSL\Ubuntu-22.04`；实验虚拟机使用 Linux `6.8.0-138-generic`、默认 MPTCP 调度器与 Cubic。
 - 保持原 16 主机、3 台 BMv2 交换机、29 条 direct 链路和 25/60/140 Mbps 异构交换路径不变；TCP 和 MPTCP 每个重复内随机顺序运行。
@@ -121,7 +107,7 @@
 - 每个 MPTCP 正式运行不仅检查 `MPTCP_INFO`，还要求 `ss` 至少观察到两条 `ESTABLISHED` 内核子流，13/13 次均通过，所有 26 轮均完整结束。
 - 原生实验测量“从 `sendall` 提交到有序字节流交付”的时延；原型测量逐子流到达时延，两种口径不得直接合并或作配对统计。
 
-### 9.2 结果
+### 8.2 结果
 
 | 场景 | TCP | Linux MPTCP | 可支持的结论 |
 |---|---:|---:|---|
@@ -133,14 +119,14 @@
 
 表中为均值 ± s.d.。完整 95% t 区间见原生参考报告。静态结果不能写成“Linux MPTCP 普遍弱于 TCP”；它只说明默认内核调度在本实验的高度异构、软件交换环境中会受到慢路径拖累。动态场景的三阶段吞吐同时受连接升速影响，因此仅保留为 ECN 操纵核验，不作为自适应性能优势证据。
 
-### 9.3 对论文论证的新增价值
+### 8.3 原生参考的解释边界
 
-该参考实验补上了此前最明显的外部有效性缺口：论文现在可以用实测而非概念描述区分“Linux 内核原生 MPTCP”与“用户态 MPTCP 语义原型”。结果形成一个清晰的边界论证：原生 MPTCP 已提供标准化多路径故障容错，但默认调度器在强异构路径上暴露吞吐与有序时延代价；本文创新应落在 P4 全局遥测、受约束调度和分层恢复的可观测控制设计，而不能宣称重新实现或全面超越 Linux MPTCP。
+该参考实验用实测区分了 Linux 内核原生 MPTCP 与用户态 MPTCP 语义原型。原生 MPTCP 提供标准化多路径故障容错，但默认调度器在本实验的强异构路径上暴露吞吐和有序时延代价。该对照只用于界定两套实验的行为边界，不表示原型已重新实现或全面超越 Linux MPTCP。
 
-### 9.4 权威文件
+### 8.4 权威文件
 
 - 原生逐轮结果：`mptcp_exp/results/native_mptcp/reference_v1/results.json`
 - 统计汇总：`mptcp_exp/results/native_mptcp/reference_v1/summary.json`
 - Source Data：`mptcp_exp/results/native_mptcp/reference_v1/source_data.csv`
 - 独立报告：`mptcp_exp/results/native_mptcp/reference_v1/REPORT.md`
-- 图件：`fig_native_reference.{svg,pdf,png}`；源代码与 alignment/collision QA 同目录。投稿用 TIFF 可由矢量图重新导出。
+- 图件：`fig_native_reference.{svg,pdf,png}`；源代码与 alignment/collision QA 同目录。TIFF 未纳入仓库，可由矢量图重新导出。
