@@ -1,90 +1,60 @@
-# MPTCP 多路径实验(DSN/SSN 二维流量控制)
+# 实验实现与复现入口
 
-在 16 节点自由通讯基础上,升级为 MPTCP 风格的多路径:每对流随机 3~4 条子流
-(1 条直连不走交换机,其余经交换机),用 DSN/SSN 二维结构做流量控制,
-DCQCN + Credit + RL 三域协同拥塞控制。
+本目录包含两套互相独立、不可混合统计的实验：
 
-详细设计见 `MPTCP_DESIGN.md`。
+1. **用户态 MPTCP 语义原型**：16 个命名空间、3 台 BMv2 交换机、direct 路径与 25/60/140 Mbps 异构交换路径；研究 P4 遥测、ECN/Credit、受约束残差 Q 控制和分层恢复。
+2. **Linux 原生 MPTCP 参考实验**：在 Linux 6.8 内核上使用原生 MPTCP 和 Cubic，测量有序字节流交付，用于外部行为参考。
 
-## 文件说明
+原型记录逐子流到达时延，原生实验记录有序字节流交付时延。二者定义不同，不能合并或作配对统计。
 
-| 文件 | 作用 |
+## 主要入口
+
+| 文件 | 用途 |
 |---|---|
-| `flow_mptcp.py` | 数据模型:Flow(DSN 序列 + 乱序缓冲)/ Subflow(SSN 序列 + path=direct\|sw1\|sw2\|sw3);随机 3~4 子流其中 1 条直连 |
-| `run_mptcp.py` | 主脚本:16 命名空间 + 3 台 BMv2(独立子网/thrift/ECN)+ 直连 veth;异构配置;多里程碑演示 + 真实训练 |
-| `tcp_stack.py` | 自定义 TCP:握手/序号/ACK/RTO 重传/cwnd(可被 RL 覆盖)+ 重传路径 |
-| `mptcp_io.py` | DSN/SSN 标记的传输:发送端按 SSN 编号,接收端按 DSN 重组 |
-| `mptcp_tcp.py` | **真实内核 TCP 子流传输 + DSN 重排**(帧头带 payload 长度);`MptcpGroupSender` 四层重传恢复 + **应用层 cwnd/credit 窗口**(RL 设置 cwnd,in_flight < min(cwnd, credit) 才发);`cc_mode` 支持 `rl`/`lia`/`olia`/`fixed`/`aimd` 五种拥塞控制 |
-| `mptcp_scheduler.py` | 多交换机感知调度:DCQCN(每交换机独立 ECN)+ Credit + RL(路径比例/cwnd/成本);`RlScheduler` 内嵌调度器驱动真实发送 |
-| `rl_train_mptcp.py` | 离线分层 Q-learning(路径比例 profile + cwnd),交替冻结训练;导出 Q 表数值 |
-| `rl_real_train.py` | 真实环境训练:读真实 ECN/丢包/时延做奖励,微调策略;从离线 Q **warm-start**,保存时导出 `policy_path`/`policy_cwnd` 供调度器加载 |
-| `simple_router_global.p4` | 数据面:转发 + ECN 标记 + meter 限速 |
-| `MPTCP_DESIGN.md` | 设计蓝图 |
+| `run_mptcp.py` | 原型的拓扑、拥塞控制、动态 ECN 和恢复消融入口 |
+| `mptcp_tcp.py` | 多子流发送、DSN 重排、窗口控制与分层恢复 |
+| `mptcp_scheduler.py` | ECN/Credit 与残差 Q 调度 |
+| `simple_router_global.p4` | P4 转发、ECN 标记和计量 |
+| `policy_mptcp_real.json` | 正式实验使用的残差策略 |
+| `analyze_paper_results.py` | 生成原型统计汇总和 Source Data |
+| `make_paper_evidence_figure.py` | 生成论文主证据图 |
+| `run_native_reference.py` | 原生 TCP/MPTCP 正式对照套件 |
+| `analyze_native_reference.py` | 生成原生参考统计和 Source Data |
+| `prepare_native_vm.sh` | 准备原生 MPTCP 虚拟机环境 |
 
-## 运行
+设计细节见 [`MPTCP_DESIGN.md`](MPTCP_DESIGN.md)，结果导航见 [`results/README.md`](results/README.md)。
+
+## 原型实验
+
+运行环境为带 P4/BMv2、Mininet 和 Python 2 的实验容器：
 
 ```bash
 docker start p4app
-docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py"
+docker exec p4app bash -lc "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --help"
 ```
 
-脚本自动:编译 P4 → 建 16 命名空间 + **3 台交换机** → 建直连 veth → 验证直连绕过交换机 →
-M3/M4 多子流 DSN 重组 → M5-M7 三域拥塞 → **9b 比例分流 + 重传选路** → **10b 真实环境 RL 训练** →
-**11 断链重路由演示**。
+正式结果包含：
 
-非交互参数(无需 tty,Claude Code 里可直接跑):
+- 7 种拥塞控制模式的比较；
+- 正常、高 ECN、恢复三阶段动态实验；
+- 无恢复、replay、NAK/SACK、完整恢复四级消融。
+
+## Linux 原生 MPTCP 参考
+
+原生套件需要支持 MPTCP 协议 262 的 Linux 内核、KVM/QEMU、BMv2 和网络命名空间。正式环境为 Linux `6.8.0-138-generic`。运行前请阅读脚本参数，避免在未准备的宿主机上直接启动网络拓扑：
 
 ```bash
-docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --cut sw1"
-docker exec p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py --demo 'sleep 3|cut sw1|sleep 5|up sw1|sleep 5|cut sw2|sleep 5'"
+python3 mptcp_exp/run_native_reference.py --help
 ```
 
-交互模式(需 tty):`docker exec -it p4app bash -c "cd /workspace && python2 -u mptcp_exp/run_mptcp.py"`,
-到 `mptcp>` 提示符后输入 `cut <path>` / `up <path>` / `quit`。cut/up 在 netns 内真正切换接口,`up`
-后 ~2s 该子流自动重连恢复载流。
+正式结果位于 [`results/native_mptcp/reference_v1/`](results/native_mptcp/reference_v1/)。
 
-## 已实现里程碑
+## 结果重建
 
-| 里程碑 | 内容 | 实测 |
-|---|---|---|
-| M1 | DSN/SSN 模型 + 随机 3~4 子流(1直连) | 29 流:29直连+sw1 29+sw2 29+sw3 21 |
-| M2 | 3 台交换机 + 直连双路径拓扑 | 直连 ping 绕过交换机 |
-| M3-M4 | SSN 发送 + DSN 重组 | 60段跨3子流全按DSN有序 |
-| M5-M7 | DCQCN+Credit+RL 三域调度 | ECN高时交换机子流降速,直连保持 |
-| 异构 | 3 交换机不同带宽/ECN阈值/tc链路 | sw1=25M/ecn5/WiFi, sw2=60M/ecn20/蜂窝, sw3=140M/ecn60/光纤 |
-| 成本感知 | PATH_COST 进奖励与选路 | sw2(蜂窝,贵)仅分 2% 流量 |
-| 比例分流 | 连续比例按路径特征分配 | 500段:direct 267/sw1 223/sw2 10 |
-| 重传选路 | 丢包重传走最健康路径 | retrans→direct(ECN/占用最低) |
-| 真实训练 | 3 交换机真实 ECN/丢包/时延驱动 RL | recv 60/60, reward 0.905, 存 policy_mptcp_real.json |
-| 断链重传 | 四层恢复:发送失败即重传 / go-back-N 重放 / NAK(最小缺失 DSN) / 停滞检测(踢出静默卡死子流) | --demo 生命周期:in_buf 0,唯一 DSN 全部按序交付 |
-| 断链重路由 | 交互 cut/up + `--cut`/`--demo` 自动演示;子流 ~2s 自动重连 | --cut sw1:received==ordered, in_buf 0 |
-| RL 策略部署 | 离线存 Q → 真实微调 **warm-start**(不冷启动)→ 保存导出 `policy_path`/`policy_cwnd` → 调度器(RlPathSelector/RlCwndController/MptcpScheduler)加载并驱动决策 | 微调后 policy_cwnd [1,1,1]→[1,0,1](state1 cwnd×2);三调度器加载单测通过 |
-| RL 驱动真实发送 | `MptcpGroupSender` 内嵌 `RlScheduler`:每轮读真实 ECN/credit/in_flight → 决策 cwnd + 路径权重;发送受 `in_flight < min(cwnd, credit)` 窗口约束;三域闭环(DCQCN 读真实 ecn_marks / Credit 接收方授信 / RL 全局) | step 11 实测:cwnd=16→4 时 inflight 跟随封顶(16→4);ECN 高时 state2 cwnd 减半;断链重传不回归 |
-| 监控页 M8 | DSN/SSN 二维实时监控:`build/monitor.html` 实时渲染每流 DSN 进度 + 每子流 SSN/接收/在途/cwnd/credit + 接收端重组 | 浏览器实时刷新,cwnd/inflight 随 RL 决策变化可见 |
-| 优雅结束 | 发送器 stop 文件触发:停发新 DSN → NAK 收尾补缺口 → FIN 关闭(替代强杀截断) | 尾部 in_buf 归 0 |
-| SACK 精确报缺 | receiver 回报 128-bit 缺失 DSN 位图,sender 只重传缺失段 | dup 从几十~几百降到 ~12 |
-| 多流并发演示 | step 11 同时 3 条 MPTCP 连接(各 3~4 子流),RL 全局感知(共享 ECN)经受真实跨流拥塞 | 3 流独立 receiver 统计;切一条不影响其他流 |
-| 对比实验 T5 | `compare_cc`:RL-cwnd vs MPTCP LIA vs OLIA vs 固定 cwnd=32 vs 伪 Reno(AIMD),采吞吐 + Jain 公平性 | 5 模式全健康(RL jain 0.997,OLIA 1.000);修复"第三条流塌缩"缺陷 |
-| 第三条流修复 | 发送器窗口水位耦合于按序 `next_dsn` → 乱序缺口冻结整条连接;改为按接收方**去重接收水位** `recv_total` 释放窗口;重传优先最空闲子流 | 修复后同一次运行仍出现子流 connect failed 但不再卡死(0.1→87 seg/s) |
-| MPTCP 标准基线 | `cc_mode='lia'/'olia'`:RFC 6356 耦合拥塞控制(`alpha=cwnd_total·max(cwnd/rtt²)/(Σ cwnd/rtt)²`);LIA/OLIA 在同一应用层框架实现,与残差 RL 苹果对苹果 | 实测聚合吞吐 RL 86.6 / LIA 85.4 / OLIA 87.0 seg/s,同一水平;OLIA 最均衡 |
-| 去 pacing + 可重复 T5 | `run_loop` 窗口忙发(去 10ms 上限)、`credit_limit` 参数化、CC step 由 NAK 反馈驱动、`ecn_collector` 改 Δmarks/Δtotal 差分、compare_cc 支持 `--cc N`(N 次重复 mean±std 落 JSON) | 去 pacing 后 CC 区分显现:Fixed 156-208 / AIMD 110-144 / LIA-OLIA 76-104 / RL 42-64 seg/s(RL 响应交换机 ECN 拥塞故低) |
-| 断链受控消融 | `--ablate-all`:逐层启用恢复(go-back-N/NAK/stall/tail),drop 最慢交换机子流,测 ordered/dup/in_buf;确定性(round-robin + 禁重连 + linger RST) | 无恢复 in_buf≈7.5k/ordered 低 → 任一恢复层 in_buf=0/ordered 近满 |
-| 动态子流管理 | `add_subflow`/`remove_subflow` + cmd_file 控制通道(模拟 ADD_ADDR/REMOVE_ADDR);sender 状态导出应用层 SSN(DSS 映射轴) | 单测:动态加 sw3、移 sw1,in_buf 0 按序 |
-| 残差 RL + 量化 | DCQCN 基线 + **5 档量化状态** + **5 档残差动作**{×0.5/0.75/1.0/1.25/1.5}:`cwnd=clamp(基线×残差)`;RL 只学"比局部机制更激进/保守" | 离线学到[1.0,1.25,1.5,0.5,0.5](低拥塞吃满带宽、高拥塞保守);部署单测通过 |
-
-## 三域拥塞控制(真实闭环)
-
-```
-拥塞域① 交换机(共享):DCQCN — 主进程周期读真实 ecn_marks → 写入 ECN 全局视图
-                       → 发送器内 RlScheduler 对高 ECN 交换机子流 cwnd 减半
-拥塞域② 节点汇聚:     Credit — 每子流在途受 credit_limit(接收方授信上限)约束
-拥塞域③ 直连(点对点):  Credit — 直连子流同样受窗口约束
-全局:                 RL(RlScheduler)— 看真实 ECN + 各子流 in_flight/credit,
-                     下发改动的 cwnd + 路径权重,真实控制每条子流发送速率
+```bash
+python3 mptcp_exp/analyze_paper_results.py
+python3 mptcp_exp/make_paper_evidence_figure.py
+python3 mptcp_exp/analyze_native_reference.py
 ```
 
-## 待办
-
-- 交互/--demo 接线动态 add/remove 命令(core 机制已通)
-- policy_mptcp_real.json 已随完整实验重训为 5 级残差(当前 [1.0,1.25,1.5,0.5,0.5])
-- T5 结果(去 pacing 后)显示 RL 因响应交换机 ECN 拥塞而吞吐最低——论文 7.3 以"接受并讨论"口径处理
+图形 QA 由 `audit_panel_alignment.py` 生成。仓库保存 PNG、SVG 和 PDF；投稿用 TIFF 可从矢量图重新导出。

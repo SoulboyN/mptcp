@@ -6,3 +6,14 @@ build/
 # Python
 __pycache__/
 *.pyc
+
+# Local experiment runtimes and caches
+.qa_deps/
+mptcp_exp/results/native_mptcp/p4-runtime.tar
+mptcp_exp/results/native_mptcp/pilot*/
+
+# Rebuildable publication exports and per-run temporary outputs
+*.tiff
+mptcp_exp/results/native_mptcp/reference_v1/static_*/
+mptcp_exp/results/native_mptcp/reference_v1/dynamic_*/
+mptcp_exp/results/native_mptcp/reference_v1/fault_*/

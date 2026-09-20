@@ -1,0 +1,87 @@
+{
+ "mean": {
+  "dup": 8.2, 
+  "in_buf": 0.0, 
+  "completion_ratio": 1.0, 
+  "ordered": 800.0
+ }, 
+ "name": "stage2-nak", 
+ "per_rep": [
+  {
+   "cut_dsn": 0, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 800, 
+   "delay_mean_ms": 588.8688978552818, 
+   "delay_p99_ms": 2418.4799194335938, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 2168.6630249023438, 
+   "completion_ratio": 1.0, 
+   "dup": 0, 
+   "in_buf": 0
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 800, 
+   "delay_mean_ms": 440.4744628071785, 
+   "delay_p99_ms": 1387.9520893096924, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1243.6249256134033, 
+   "completion_ratio": 1.0, 
+   "dup": 0, 
+   "in_buf": 0
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 800, 
+   "delay_mean_ms": 419.6962895989418, 
+   "delay_p99_ms": 1689.6650791168213, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1588.5579586029053, 
+   "completion_ratio": 1.0, 
+   "dup": 0, 
+   "in_buf": 0
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 800, 
+   "delay_mean_ms": 257.3089815064928, 
+   "delay_p99_ms": 923.8059520721436, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 814.2309188842773, 
+   "completion_ratio": 1.0, 
+   "dup": 41, 
+   "in_buf": 0
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 800, 
+   "delay_mean_ms": 328.43489795923233, 
+   "delay_p99_ms": 1486.706018447876, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1174.198865890503, 
+   "completion_ratio": 1.0, 
+   "dup": 0, 
+   "in_buf": 0
+  }
+ ], 
+ "stage": 3
+}

@@ -28,6 +28,7 @@ import os
 import sys
 import signal
 import struct
+import re
 
 # paths are relative to THIS file's directory (mptcp_exp/)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +39,7 @@ P4INFO = os.path.join(_HERE, 'build', 'simple_router_global.p4info.txt')
 # the runtime decisions (missing on first run -> schedulers fall back to
 # their built-in defaults, then the fine-tuned policy takes over next run).
 POLICY_REAL = os.path.join(_HERE, 'policy_mptcp_real.json')
+POLICY_OFFLINE = os.path.join(_HERE, 'policy_mptcp.json')
 
 NODES = 16
 NET = '10.0.0'
@@ -73,6 +75,16 @@ def sh_quiet(cmd):
     return rc
 
 
+def wait_process(proc, timeout, poll=0.05):
+    """Python-2-compatible bounded process wait. Returns True on exit."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(poll)
+    return proc.poll() is not None
+
+
 def cleanup():
     print '\n=== Cleanup ==='
     os.system('pkill -9 -f simple_switch 2>/dev/null')
@@ -104,6 +116,72 @@ def run_cli(cmds, thrift_port=9090):
     return out, err
 
 
+def _parse_indexed_registers(output, register_names, n_ports=NODES):
+    """Parse batched simple_switch_CLI register reads into per-port arrays."""
+    values = {name: {} for name in register_names}
+    pattern = re.compile(
+        r'(?P<name>%s)\s*\[\s*(?P<idx>\d+)\s*\]\s*=\s*(?P<value>\d+)' %
+        '|'.join(re.escape(name) for name in register_names))
+    for line in output.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        name = match.group('name')
+        idx = int(match.group('idx'))
+        if 0 <= idx < n_ports:
+            values[name][idx] = float(match.group('value'))
+    missing = []
+    for name in register_names:
+        for idx in range(n_ports):
+            if idx not in values[name]:
+                missing.append('%s[%d]' % (name, idx))
+    if missing:
+        raise ValueError('missing register values: %s' % ', '.join(missing))
+    return {name: [values[name][idx] for idx in range(n_ports)]
+            for name in register_names}
+
+
+def _read_switch_ecn_counters(sw_idx):
+    """Read every egress port in one CLI session for a switch."""
+    names = ('ecn_marks', 'egress_total')
+    commands = []
+    for name in names:
+        for port_idx in range(NODES):
+            commands.append('register_read %s %d' % (name, port_idx))
+    out, err = run_cli('\n'.join(commands) + '\n',
+                       thrift_port=SW_PORT[sw_idx - 1])
+    return _parse_indexed_registers(out, names)
+
+
+def _ecn_delta_snapshot(current, previous=None):
+    """Return traffic-weighted switch ECN and auditable per-port deltas."""
+    if previous is None:
+        previous = current
+    ports = {}
+    sum_dm = 0.0
+    sum_dt = 0.0
+    for idx in range(NODES):
+        marks = current['ecn_marks'][idx]
+        total = current['egress_total'][idx]
+        dm = max(0.0, marks - previous['ecn_marks'][idx])
+        dt = max(0.0, total - previous['egress_total'][idx])
+        ratio = min(1.0, dm / dt) if dt > 0 else 0.0
+        ports[idx] = {
+            'marks': marks, 'total': total,
+            'delta_marks': dm, 'delta_total': dt, 'ratio': ratio,
+        }
+        sum_dm += dm
+        sum_dt += dt
+    return ((min(1.0, sum_dm / sum_dt) if sum_dt > 0 else 0.0), ports)
+
+
+def _write_json_atomic(path, value, json_module):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json_module.dump(value, f)
+    os.rename(tmp, path)
+
+
 def ecn_collector():
     """Periodically read each switch's ecn_marks / egress_total registers and
     write the SDN global view to /tmp/ecn_global.json (shared; RL-driven
@@ -115,31 +193,22 @@ def ecn_collector():
     counter by a constant would drift to 1.0 over time and pin RL to the
     most-congested state regardless of the actual network."""
     import json as _json
-    prev = {}   # switch -> (marks, total)
+    prev = {}   # switch -> {'ecn_marks': [16], 'egress_total': [16]}
     while True:
         try:
             ecn = {}
+            detail = {'timestamp': time.time(), 'switches': {}}
             for s in range(1, N_SW + 1):
-                def _read(reg):
-                    out, _ = run_cli('register_read %s 0\n' % reg,
-                                     thrift_port=SW_PORT[s - 1])
-                    for line in out.splitlines():
-                        if '=' in line:
-                            try:
-                                return float(line.split('=')[-1].strip())
-                            except ValueError:
-                                continue
-                    return 0.0
-                marks = _read('ecn_marks')
-                total = _read('egress_total')
-                pmarks, ptotal = prev.get(s, (marks, total))
-                dm = max(0.0, marks - pmarks)
-                dt = max(0.0, total - ptotal)
-                prev[s] = (marks, total)
-                # ratio of CE-marked packets among this poll's egress traffic
-                ecn[s] = min(1.0, dm / dt) if dt > 0 else 0.0
-            with open('/tmp/ecn_global.json', 'w') as f:
-                _json.dump(ecn, f)
+                current = _read_switch_ecn_counters(s)
+                ratio, ports = _ecn_delta_snapshot(current, prev.get(s))
+                prev[s] = current
+                # Traffic-weighted ratio across all 16 egress ports.
+                ecn[s] = ratio
+                detail['switches'][s] = {'ratio': ratio, 'ports': ports}
+            # Keep the legacy flat file consumed by senders, and add a full
+            # per-port snapshot for validation and experiment audit trails.
+            _write_json_atomic('/tmp/ecn_global.json', ecn, _json)
+            _write_json_atomic('/tmp/ecn_global_detail.json', detail, _json)
         except Exception:
             pass
         time.sleep(1.0)
@@ -248,6 +317,7 @@ def main():
     #   --ablate-all       : run all 4 ablation stages (0..3)
     argv = [a for a in sys.argv]
     cc_mode = '--cc' in argv
+    dynamic_mode = '--dynamic' in argv
     ablate_mode = None
     ablate_all = '--ablate-all' in argv
     for i, a in enumerate(argv):
@@ -363,7 +433,10 @@ def main():
     #   sw2: medium(cellular-like, mid bw, medium ECN)
     #   sw3: fast  (fiber-like, high bw, tolerant ECN)
     SW_BW_MBPS  = {1: 25, 2: 60, 3: 140}      # per-switch bandwidth (Mbps)
-    SW_ECN_THR  = {1: 5,  2: 20, 3: 60}       # ECN queue-depth threshold
+    # BMv2 exposes deq_timedelta rather than a usable queue-depth signal.
+    # Calibrated with real traffic so ECN spans a useful range instead of
+    # saturating at 100% (the old 5/20/60 values marked almost every packet).
+    SW_ECN_THR  = {1: 50, 2: 100, 3: 200}      # deq_timedelta threshold
     print '\n=== 7b. Heterogeneous switch config (bw + ECN) ==='
     for s in range(1, N_SW + 1):
         bw = SW_BW_MBPS[s]
@@ -427,6 +500,13 @@ def main():
                    results_out=os.path.join(results_dir, 't5_cc.json'))
         print '\n=== Done (--cc, topology up) ==='
         print 'Ctrl-C to cleanup.'
+        return
+    if dynamic_mode:
+        demo_flows = [f for f in flows if len(f.subflows) >= 3][:3]
+        dynamic_adaptation(
+            demo_flows, direct_links, n_rep=3,
+            results_out=os.path.join(results_dir, 'dynamic_adaptation.json'))
+        print '\n=== Done (--dynamic, topology up) ==='
         return
     if ablate_mode is not None or ablate_all:
         stages = [ablate_mode] if ablate_mode is not None else [0, 1, 3, 15]
@@ -645,16 +725,14 @@ def main():
             return total_recv, total_sent, avg_delay
 
         def _read_real_ecn(sw_idx):
-            """Read REAL ecn_marks of switch sw_idx via CLI."""
-            out, _ = run_cli('register_read ecn_marks 0\n',
-                             thrift_port=SW_PORT[sw_idx - 1])
-            for line in out.splitlines():
-                if '=' in line:
-                    try:
-                        return min(1.0, float(line.split('=')[-1].strip()) / 200.0)
-                    except ValueError:
-                        continue
-            return 0.0
+            """Use the same all-egress delta ECN view as deployed senders."""
+            try:
+                import json as _json
+                with open('/tmp/ecn_global.json') as f:
+                    values = _json.load(f)
+                return float(values.get(str(sw_idx), values.get(sw_idx, 0.0)))
+            except Exception:
+                return 0.0
 
         print '\n=== 10b. Real-environment RL fine-tuning ==='
         trainer.train_loop(rounds=6, sw_ports=[1, 2, 3],
@@ -748,22 +826,35 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
     import mptcp_tcp
     import re as _re
     import json as _json
+    import ast as _ast
+    import random as _random
     _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
     def sw_ip(i, s):
         return '{}.{}'.format(_SW_NET[s], i)
-    modes = [('rl', 'RL-cwnd (fine-tuned)'),
-             ('lia', 'MPTCP LIA (RFC 6356)'),
-             ('olia', 'MPTCP OLIA'),
-             ('fixed', 'Fixed cwnd=32'),
-             ('aimd', 'Pseudo-Reno (AIMD)')]
+    # result key, sender cc_mode, label, policy path. The first three rows
+    # isolate the learned residual from the same ECN/Credit local baseline.
+    modes = [
+        ('local', 'local', 'ECN/Credit baseline (no RL)', POLICY_REAL),
+        ('rl_offline', 'rl', 'Residual Q (offline)', POLICY_OFFLINE),
+        ('rl', 'rl', 'Residual Q (fine-tuned)', POLICY_REAL),
+        ('lia', 'lia', 'LIA-inspired (user-space)', POLICY_REAL),
+        ('olia', 'olia', 'OLIA-inspired (user-space)', POLICY_REAL),
+        ('fixed', 'fixed', 'Fixed cwnd=32', POLICY_REAL),
+        ('aimd', 'aimd', 'Pseudo-Reno (AIMD)', POLICY_REAL),
+    ]
     n_modes = len(modes)
     print '\n=== 13. Congestion-control comparison (T5): %d modes x %d reps ===' % (
         n_modes, n_rep)
     # mode -> {rep: [per-flow thpt]}
-    per_rep = {mode: [] for mode, _ in modes}
+    per_rep = {key: [] for key, _, _, _ in modes}
+    metrics_per_rep = {key: [] for key, _, _, _ in modes}
     dropped = {}   # mode -> count of reps dropped as outliers
     for rep in range(n_rep):
-        for mi, (mode, label) in enumerate(modes):
+        run_order = list(modes)
+        _random.Random(20260919 + rep).shuffle(run_order)
+        mode_index = {spec[0]: i for i, spec in enumerate(modes)}
+        for key, mode, label, policy_path in run_order:
+            mi = mode_index[key]
             base_port = 8000 + (rep * n_modes + mi) * 10   # fresh ports per rep
             receivers, senders = [], []
             for fi, demo in enumerate(demos):
@@ -783,6 +874,7 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
                         NS(demo.dst)) % (rep, mi, fi),
                     shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 receivers.append((demo, rp))
+                time.sleep(0.2)
                 send_dest = []
                 for k, sf in enumerate(demo.subflows):
                     if sf.path == 'direct':
@@ -803,7 +895,7 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
                     'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, '
                     'cc_mode=%r, credit_limit=%d, pace=%r)\n'
                     'g.run_loop(stop_file=%r)\n'
-                ) % (demo.fid, send_dest, port, POLICY_REAL, mode,
+                ) % (demo.fid, send_dest, port, policy_path, mode,
                      credit_limit, pace, stopf)
                 with open('/tmp/cc_send_%d_%d_%d.py' % (rep, mi, fi), 'w') as f:
                     f.write(snd_body)
@@ -815,12 +907,23 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
                     stderr=subprocess.STDOUT)
                 senders.append((demo, sp, stopf))
             time.sleep(1)
-            time.sleep(run_seconds)
+            ecn_samples = []
+            mode_started = time.time()
+            while time.time() - mode_started < run_seconds:
+                time.sleep(0.5)
+                try:
+                    with open('/tmp/ecn_global.json') as _f:
+                        values = [float(v) for v in _json.load(_f).values()]
+                    if values:
+                        ecn_samples.append(max(values))
+                except Exception:
+                    pass
             for demo, sp, stopf in senders:
                 try:
                     with open(stopf, 'w'):
                         pass
-                    sp.wait(timeout=6)
+                    if not wait_process(sp, 6):
+                        raise RuntimeError('sender did not stop within 6s')
                 except Exception:
                     try:
                         os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
@@ -828,12 +931,40 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
                         pass
             time.sleep(3)
             thpt = []
+            recv_stats = []
             for demo, rp in receivers:
                 out = rp.stdout.read()
-                m = _re.search(r"'ordered': (\d+)", out)
-                ordered = int(m.group(1)) if m else 0
+                m = _re.search(r'OK\s+(\{.*\})', out, _re.S)
+                try:
+                    stats = _ast.literal_eval(m.group(1)) if m else {}
+                except Exception:
+                    stats = {}
+                ordered = int(stats.get('ordered', 0))
                 thpt.append(ordered / float(run_seconds))
-            per_rep[mode].append(thpt)
+                recv_stats.append(stats)
+            connect_failures = 0
+            for demo, sp, stopf in senders:
+                try:
+                    with open('/tmp/cc_send_%d_%d_%d.out' %
+                              (rep, mi, demo.fid)) as f:
+                        connect_failures += f.read().count('connect failed')
+                except Exception:
+                    pass
+            per_rep[key].append(thpt)
+            metrics_per_rep[key].append({
+                'delay_mean_ms': (sum(float(s.get('delay_mean_ms', 0.0))
+                                      for s in recv_stats) / max(len(recv_stats), 1)),
+                'delay_p95_ms': max([float(s.get('delay_p95_ms', 0.0))
+                                     for s in recv_stats] or [0.0]),
+                'delay_p99_ms': max([float(s.get('delay_p99_ms', 0.0))
+                                     for s in recv_stats] or [0.0]),
+                'dup': sum(int(s.get('dup', 0)) for s in recv_stats),
+                'in_buf': sum(int(s.get('in_buf', 0)) for s in recv_stats),
+                'ecn_mean': (sum(ecn_samples) / len(ecn_samples))
+                            if ecn_samples else 0.0,
+                'ecn_peak': max(ecn_samples) if ecn_samples else 0.0,
+                'connect_failures': connect_failures,
+            })
             n = len(thpt)
             jain = ((sum(thpt) ** 2) / (n * sum(x * x for x in thpt))) \
                 if n and sum(thpt) else 0.0
@@ -842,16 +973,14 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
     # ---- aggregate: per-flow mean/std over reps, Jain from means ----
     import math as _math
     results = {}
-    for mode, label in modes:
-        reps = [r for r in per_rep[mode] if r]
+    for key, mode, label, policy_path in modes:
+        reps = [r for r in per_rep[key] if r]
         n_flow = len(reps[0])
-        # drop outlier reps (any flow < 50% of the median across reps)
-        med = [sorted(r[i] for r in reps)[len(reps) // 2] for i in range(n_flow)]
-        keep = [r for r in reps
-                if all(r[i] >= 0.5 * med[i] for i in range(n_flow))]
-        dropped[mode] = len(reps) - len(keep)
-        if not keep:
-            keep = reps
+        # Keep every repetition. Connection-establishment failures are an
+        # explicit reliability metric, not a post-hoc outlier to discard.
+        keep_idx = range(len(reps))
+        keep = reps
+        dropped[key] = 0
         means = [sum(r[i] for r in keep) / float(len(keep))
                  for i in range(n_flow)]
         stds = [_math.sqrt(sum((r[i] - means[i]) ** 2 for r in keep)
@@ -859,11 +988,20 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
         s = sum(means)
         jain = (s * s) / (n_flow * sum(m * m for m in means)) \
             if s else 0.0
-        results[mode] = {
+        metric_rows = [metrics_per_rep[key][ri] for ri in keep_idx]
+        metric_mean = {}
+        if metric_rows:
+            for metric in metric_rows[0]:
+                metric_mean[metric] = sum(r[metric] for r in metric_rows) / len(metric_rows)
+        results[key] = {
             'label': label,
-            'per_rep': per_rep[mode],
+            'cc_mode': mode,
+            'policy_path': policy_path,
+            'per_rep': per_rep[key],
+            'metrics_per_rep': metrics_per_rep[key],
+            'metrics_mean': metric_mean,
             'n_rep_used': len(keep),
-            'n_rep_dropped': dropped[mode],
+            'n_rep_dropped': dropped[key],
             'mean': means, 'std': stds, 'jain': jain,
         }
         print '  %-24s mean=%s +- %s seg/s  jain=%.4f  (used %d/%d reps)' % (
@@ -880,8 +1018,210 @@ def compare_cc(demos, pairs, direct_links, run_seconds=8, n_rep=5,
     return results
 
 
-def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
-                      results_out=None, n_rep=3):
+def dynamic_adaptation(demos, direct_links, n_rep=3, run_seconds=9,
+                       results_out=None):
+    """Within-run dynamic heterogeneity experiment.
+
+    Three concurrent real-TCP MPTCP-style connections experience a normal
+    3-second phase, a 3-second high-ECN phase, and a 3-second recovery phase.
+    Compare the same local ECN/Credit controller with and without the learned
+    residual.  The parent samples sender state every 0.5 s, yielding actual
+    phase throughput, cwnd, path share and ECN traces rather than a synthetic
+    state-transition demonstration.
+    """
+    import json as _json
+    import re as _re
+    import ast as _ast
+    _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    normal_thr = {1: 50, 2: 100, 3: 200}
+    congest_thr = {1: 5, 2: 10, 3: 20}
+    modes = [('local', 'ECN/Credit baseline (no RL)'),
+             ('rl', 'Residual Q (fine-tuned)')]
+    phase_len = run_seconds / 3.0
+    all_rows = {m: [] for m, _ in modes}
+
+    def _set_thresholds(values):
+        for s, value in values.items():
+            run_cli('register_write ecn_thresh 0 %d\n' % value,
+                    thrift_port=SW_PORT[s - 1])
+
+    def _phase(t):
+        return 'normal' if t < phase_len else (
+            'congested' if t < 2 * phase_len else 'recovery')
+
+    print '\n=== Dynamic heterogeneity: 2 modes x %d reps ===' % n_rep
+    for rep in range(n_rep):
+        for mode, label in modes:
+            _set_thresholds(normal_thr)
+            base_port = 9400 + rep * 20 + (0 if mode == 'local' else 10)
+            receivers, senders = [], []
+            for fi, demo in enumerate(demos):
+                port = base_port + fi
+                recv_body = (
+                    'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                    'import mptcp_tcp\n'
+                    'r=mptcp_tcp.TcpDsnReceiver(%d,n_subflows=%d,timeout=%d)\n'
+                    'r.recv_loop(%d)\nprint "OK", r.stats()\n'
+                ) % (port, len(demo.subflows), run_seconds + 8,
+                     run_seconds + 8)
+                rfile = '/tmp/dyn_recv_%d_%s_%d.py' % (rep, mode, fi)
+                with open(rfile, 'w') as f:
+                    f.write(recv_body)
+                rp = subprocess.Popen(
+                    'ip netns exec %s python2 -u %s' % (NS(demo.dst), rfile),
+                    shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                receivers.append(rp)
+                time.sleep(0.2)
+                dests = []
+                for k, sf in enumerate(demo.subflows):
+                    if sf.path == 'direct':
+                        ipb = direct_links[sf.sid][3].split('/')[0]
+                    else:
+                        ipb = '%s.%d' % (_SW_NET[int(sf.path[2])], demo.dst)
+                    dests.append((ipb, k, sf.path))
+                stopf = '/tmp/dyn_stop_%d_%s_%d' % (rep, mode, fi)
+                try:
+                    os.remove(stopf)
+                except Exception:
+                    pass
+                statef = '/tmp/mptcp_sender_%d.json' % demo.fid
+                try:
+                    os.remove(statef)
+                except Exception:
+                    pass
+                snd_body = (
+                    'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
+                    'import mptcp_tcp\n'
+                    'g=mptcp_tcp.MptcpGroupSender(%d,%r,%d,policy_path=%r,'
+                    'cc_mode=%r,credit_limit=128,pace=0.0002)\n'
+                    'g.run_loop(stop_file=%r)\n'
+                ) % (demo.fid, dests, port, POLICY_REAL, mode, stopf)
+                sfile = '/tmp/dyn_send_%d_%s_%d.py' % (rep, mode, fi)
+                ofile = '/tmp/dyn_send_%d_%s_%d.out' % (rep, mode, fi)
+                with open(sfile, 'w') as f:
+                    f.write(snd_body)
+                sp = subprocess.Popen(
+                    'ip netns exec %s python2 -u %s' % (NS(demo.src), sfile),
+                    shell=True, preexec_fn=os.setsid,
+                    stdout=open(ofile, 'w'), stderr=subprocess.STDOUT)
+                senders.append((demo, sp, stopf, statef))
+
+            started = time.time()
+            switched_high = switched_restore = False
+            samples = []
+            while time.time() - started < run_seconds:
+                elapsed = time.time() - started
+                if elapsed >= phase_len and not switched_high:
+                    _set_thresholds(congest_thr)
+                    switched_high = True
+                if elapsed >= 2 * phase_len and not switched_restore:
+                    _set_thresholds(normal_thr)
+                    switched_restore = True
+                time.sleep(0.5)
+                dsn_total = 0
+                cwnds, states = [], []
+                path_counts = {'direct': 0, 'sw1': 0, 'sw2': 0, 'sw3': 0}
+                for demo, sp, stopf, statef in senders:
+                    try:
+                        st = _json.load(open(statef))
+                        dsn_total += int(st.get('dsn_next', 0))
+                        states.append(int(st.get('state', 0)))
+                        for sf in st.get('subflows', {}).values():
+                            cwnds.append(float(sf.get('cwnd', 0)))
+                            p = sf.get('path')
+                            path_counts[p] = path_counts.get(p, 0) + int(sf.get('send', 0))
+                    except Exception:
+                        pass
+                try:
+                    ev = [float(v) for v in _json.load(
+                        open('/tmp/ecn_global.json')).values()]
+                except Exception:
+                    ev = []
+                samples.append({
+                    't_s': elapsed, 'phase': _phase(elapsed),
+                    'dsn_total': dsn_total,
+                    'cwnd_mean': sum(cwnds) / len(cwnds) if cwnds else 0.0,
+                    'state_max': max(states) if states else 0,
+                    'ecn_max': max(ev) if ev else 0.0,
+                    'path_send_total': path_counts,
+                })
+
+            for demo, sp, stopf, statef in senders:
+                with open(stopf, 'w'):
+                    pass
+                if not wait_process(sp, 12):
+                    try:
+                        os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
+                    except Exception:
+                        pass
+            _set_thresholds(normal_thr)
+            recv_stats = []
+            for rp in receivers:
+                out = rp.stdout.read()
+                m = _re.search(r'OK\s+(\{.*\})', out, _re.S)
+                try:
+                    recv_stats.append(_ast.literal_eval(m.group(1)) if m else {})
+                except Exception:
+                    recv_stats.append({})
+
+            phases = {}
+            for ph in ('normal', 'congested', 'recovery'):
+                ss = [x for x in samples if x['phase'] == ph]
+                if len(ss) >= 2:
+                    dt = max(ss[-1]['t_s'] - ss[0]['t_s'], 1e-6)
+                    thpt = (ss[-1]['dsn_total'] - ss[0]['dsn_total']) / dt
+                    path_delta = {}
+                    for p in ss[-1]['path_send_total']:
+                        path_delta[p] = (ss[-1]['path_send_total'].get(p, 0) -
+                                         ss[0]['path_send_total'].get(p, 0))
+                    total_path = float(sum(path_delta.values())) or 1.0
+                    shares = {p: v / total_path for p, v in path_delta.items()}
+                else:
+                    thpt, shares = 0.0, {}
+                phases[ph] = {
+                    'throughput_seg_s': thpt,
+                    'cwnd_mean': sum(x['cwnd_mean'] for x in ss) / len(ss) if ss else 0.0,
+                    'ecn_mean': sum(x['ecn_max'] for x in ss) / len(ss) if ss else 0.0,
+                    'state_mean': sum(x['state_max'] for x in ss) / float(len(ss)) if ss else 0.0,
+                    'path_share': shares,
+                }
+            row = {
+                'rep': rep, 'mode': mode, 'samples': samples, 'phases': phases,
+                'delay_mean_ms': sum(float(x.get('delay_mean_ms', 0)) for x in recv_stats) / max(len(recv_stats), 1),
+                'delay_p95_ms': max([float(x.get('delay_p95_ms', 0)) for x in recv_stats] or [0]),
+                'ordered': sum(int(x.get('ordered', 0)) for x in recv_stats),
+            }
+            all_rows[mode].append(row)
+            print '  [dyn rep %d] %-28s phase_thpt=%s' % (
+                rep, label, {p: round(phases[p]['throughput_seg_s'], 1)
+                             for p in phases})
+
+    result = {'phase_seconds': phase_len, 'thresholds': {
+                  'normal': normal_thr, 'congested': congest_thr},
+              'modes': {}}
+    for mode, label in modes:
+        rows = all_rows[mode]
+        summary = {}
+        for ph in ('normal', 'congested', 'recovery'):
+            summary[ph] = {}
+            for metric in ('throughput_seg_s', 'cwnd_mean', 'ecn_mean', 'state_mean'):
+                vals = [r['phases'][ph][metric] for r in rows]
+                summary[ph][metric] = sum(vals) / len(vals)
+            paths = ('direct', 'sw1', 'sw2', 'sw3')
+            summary[ph]['path_share'] = {
+                p: sum(r['phases'][ph]['path_share'].get(p, 0.0)
+                       for r in rows) / len(rows) for p in paths}
+        result['modes'][mode] = {'label': label, 'per_rep': rows,
+                                 'phase_mean': summary}
+    if results_out:
+        with open(results_out, 'w') as f:
+            _json.dump(result, f, indent=1)
+        print '  [dynamic] written to', results_out
+    return result
+
+
+def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=35,
+                      results_out=None, n_rep=5, target_segments=800):
     """Controlled resilience ablation (paper Fig. 8): the same cut/up script
     is replayed under progressively enabled recovery layers, and the receiver
     reports (ordered, dup, in_buf). stage bitmask over
@@ -890,7 +1230,11 @@ def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
     import mptcp_tcp
     import json as _json
     import re as _re
+    import ast as _ast
     _SW_NET = {1: '10.0.0', 2: '10.2.0', 3: '10.3.0'}
+    _SW_TC = {1: 'delay 10ms 2ms loss 1%',
+              2: 'delay 30ms 10ms loss 2%',
+              3: 'delay 2ms loss 0.1%'}
     def sw_ip(i, s):
         return '{}.{}'.format(_SW_NET[s], i)
     stages_map = {
@@ -929,7 +1273,7 @@ def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
             'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
             'import mptcp_tcp\n'
             'r = mptcp_tcp.TcpDsnReceiver(%d, n_subflows=%d, timeout=%d)\n'
-            'o = r.recv_loop(%d)\n'
+            'o = r.recv_loop(%d, idle_after_close=2.0)\n'
             'print "OK", r.stats()\n'
         ) % (port, n_sub, run_seconds + 8, run_seconds + 8)
         with open('/tmp/abl_recv_%d_%d.py' % (stage, rep), 'w') as f:
@@ -938,20 +1282,42 @@ def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
             'ip netns exec {} python2 -u /tmp/abl_recv_%d_%d.py'.format(
                 NS(demo.dst)) % (stage, rep),
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # Give the listener time to bind before opening three simultaneous
+        # TCP subflows. This removes sporadic initial-connect failures.
+        time.sleep(0.5)
         stopf = '/tmp/abl_stop_%d_%d' % (stage, rep)
+        cmdf = '/tmp/abl_cmd_%d_%d' % (stage, rep)
+        progressf = '/tmp/abl_progress_%d_%d' % (stage, rep)
+        resumef = '/tmp/abl_resume_%d_%d' % (stage, rep)
         try:
             os.remove(stopf)
         except Exception:
             pass
+        try:
+            os.remove(cmdf)
+        except Exception:
+            pass
+        try:
+            os.remove(progressf)
+        except Exception:
+            pass
+        for _p in (resumef, cmdf + '.ack'):
+            try:
+                os.remove(_p)
+            except Exception:
+                pass
         snd_body = (
             'import sys; sys.path.insert(0, "/workspace/mptcp_exp")\n'
             'import mptcp_tcp\n'
             'g = mptcp_tcp.MptcpGroupSender(%d, %r, %d, policy_path=%r, '
             'cc_mode=%r, fixed_cwnd=%d, credit_limit=%d, pace=%r, stages=%r, '
-            'round_robin=True, auto_drop_sid=%d, auto_drop_at=%r)\n'
-            'g.run_loop(stop_file=%r)\n'
+            'round_robin=True, auto_drop_sid=%d, auto_drop_at=None)\n'
+            'g.run_loop(stop_file=None, settle=10.0, cmd_file=%r, '
+            'max_segments=%d, progress_file=%r, pause_at=%d, '
+            'resume_file=%r)\n'
         ) % (demo.fid, send_dest, port, POLICY_REAL, 'fixed',
-             300, 300, 0.0002, stages_map[stage], drop_sid, 3.0, stopf)
+             300, 300, 0.0002, stages_map[stage], drop_sid, cmdf,
+             target_segments, progressf, 100, resumef)
         with open('/tmp/abl_send_%d_%d.py' % (stage, rep), 'w') as f:
             f.write(snd_body)
         sp = subprocess.Popen(
@@ -960,25 +1326,78 @@ def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
             shell=True, preexec_fn=os.setsid,
             stdout=open('/tmp/abl_send_%d_%d.out' % (stage, rep), 'w'),
             stderr=subprocess.STDOUT)
-        # deterministic lifecycle: sender drops subflow sid=1 at t=3s; let the
-        # enabled recovery layers (if any) fill the gap, then stop at t=run.
-        time.sleep(run_seconds)
-        try:
-            with open(stopf, 'w'):
+        # Real path-level failure: bring down the switch-side egress interface
+        # after 100 DSNs, then notify the sender that SDN confirmed the failure.
+        # This strands real kernel-TCP data on the failed path while keeping
+        # recovery-layer behavior controlled and reproducible.
+        cut_dsn = 100
+        wait_deadline = time.time() + 8.0
+        progress = 0
+        while time.time() < wait_deadline and progress < cut_dsn:
+            try:
+                with open(progressf) as f:
+                    progress = int(f.read().strip() or 0)
+            except Exception:
                 pass
-            sp.wait(timeout=8)
+            time.sleep(0.02)
+        cut_path = demo.subflows[drop_sid].path
+        cut_sw = int(cut_path[2])
+        # Black-hole the sender namespace's real egress path in the kernel.
+        # A veth down/up cycle makes BMv2 permanently lose its raw-socket port
+        # until the whole switch is restarted, invalidating later repetitions.
+        # Replacing the host qdisc with 100% loss is an equivalent data-plane
+        # outage, flushes queued packets, and can be restored reproducibly.
+        cut_iface = H_SW_INTF(demo.src, cut_sw)
+        cut_rc = sh_quiet('ip netns exec %s tc qdisc replace dev %s root netem loss 100%%' % (
+            NS(demo.src), cut_iface))
+        fault_burst = 30
+        with open(cmdf, 'w') as f:
+            f.write('faultburst %d %d\nfail %d\n' % (
+                drop_sid, fault_burst, drop_sid))
+        # Do not release the DSN barrier until the sender has consumed the
+        # failure command and removed the dead subflow.
+        ack_deadline = time.time() + 3.0
+        while time.time() < ack_deadline and not os.path.exists(cmdf + '.ack'):
+            time.sleep(0.01)
+        with open(resumef, 'w') as f:
+            f.write('resume\n')
+        try:
+            if not wait_process(sp, run_seconds):
+                raise RuntimeError('sender did not finish fixed workload')
         except Exception:
             try:
                 os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
             except Exception:
                 pass
+        # Always restore the physical path before the next repetition.
+        sh_quiet('ip netns exec %s tc qdisc replace dev %s root netem %s' % (
+            NS(demo.src), cut_iface, _SW_TC[cut_sw]))
+        time.sleep(0.5)
         out = rp.stdout.read()
-        m = _re.search(r"'ordered': (\d+).*?'dup': (\d+).*?'in_buf': (\d+)",
-                       out, _re.S)
-        ordered = int(m.group(1)) if m else 0
-        dup = int(m.group(2)) if m else 0
-        in_buf = int(m.group(3)) if m else -1
-        res['per_rep'].append({'ordered': ordered, 'dup': dup, 'in_buf': in_buf})
+        m = _re.search(r'OK\s+(\{.*\})', out, _re.S)
+        try:
+            stats = _ast.literal_eval(m.group(1)) if m else {}
+        except Exception:
+            stats = {}
+        ordered = int(stats.get('ordered', 0))
+        dup = int(stats.get('dup', 0))
+        in_buf = int(stats.get('in_buf', -1))
+        unique_delivered = ordered + max(in_buf, 0)
+        res['per_rep'].append({
+            'ordered': ordered, 'dup': dup, 'in_buf': in_buf,
+            'delay_mean_ms': float(stats.get('delay_mean_ms', 0.0)),
+            'delay_p95_ms': float(stats.get('delay_p95_ms', 0.0)),
+            'delay_p99_ms': float(stats.get('delay_p99_ms', 0.0)),
+            'fault_type': 'sender-egress-kernel-blackhole',
+            'fault_iface': '%s/%s' % (NS(demo.src), cut_iface),
+            'fault_rc': cut_rc,
+            'cut_dsn': progress,
+            'fault_detection_window_segments': fault_burst,
+            'target_segments': target_segments,
+            'completion_ratio': ordered / float(target_segments),
+            'unique_delivered': unique_delivered,
+            'missing_segments': max(0, target_segments - unique_delivered),
+        })
         print '  [abl rep %d] ordered=%d dup=%d in_buf=%d' % (
             rep, ordered, dup, in_buf)
     n = len(res['per_rep'])
@@ -986,6 +1405,9 @@ def ablate_resilience(flows, pairs, direct_links, stage=3, run_seconds=18,
         'ordered': sum(r['ordered'] for r in res['per_rep']) / float(n),
         'dup': sum(r['dup'] for r in res['per_rep']) / float(n),
         'in_buf': sum(r['in_buf'] for r in res['per_rep']) / float(n),
+        'completion_ratio': sum(r['completion_ratio'] for r in res['per_rep']) / float(n),
+        'unique_delivered': sum(r['unique_delivered'] for r in res['per_rep']) / float(n),
+        'missing_segments': sum(r['missing_segments'] for r in res['per_rep']) / float(n),
     }
     if results_out:
         try:
@@ -1189,7 +1611,8 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
         try:
             with open(stopfs[fid], 'w'):
                 pass
-            sp.wait(timeout=6)
+            if not wait_process(sp, 6):
+                raise RuntimeError('sender did not stop within 6s')
         except Exception:
             try:
                 os.killpg(os.getpgid(sp.pid), signal.SIGTERM)
@@ -1200,7 +1623,8 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
                     pass
     try:
         for fid, sp in snd_procs.items():
-            sp.wait(timeout=3)
+            if not wait_process(sp, 3):
+                raise RuntimeError('sender did not stop within 3s')
     except Exception:
         pass
     time.sleep(3)
@@ -1222,4 +1646,3 @@ def demo_interactive(flows, pairs, direct_links, auto_cut=None, auto_demo=None):
 
 if __name__ == '__main__':
     main()
-

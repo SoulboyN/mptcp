@@ -1,0 +1,87 @@
+{
+ "mean": {
+  "dup": 0.0, 
+  "in_buf": 714.0, 
+  "completion_ratio": 0.042249999999999996, 
+  "ordered": 33.8
+ }, 
+ "name": "stage0-no-recovery", 
+ "per_rep": [
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 35, 
+   "delay_mean_ms": 324.1297350847785, 
+   "delay_p99_ms": 1177.9379844665527, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 924.7760772705078, 
+   "completion_ratio": 0.04375, 
+   "dup": 0, 
+   "in_buf": 713
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 20, 
+   "delay_mean_ms": 399.76723123622196, 
+   "delay_p99_ms": 1279.25705909729, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1147.2699642181396, 
+   "completion_ratio": 0.025, 
+   "dup": 0, 
+   "in_buf": 724
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 44, 
+   "delay_mean_ms": 365.71535797474706, 
+   "delay_p99_ms": 1325.6502151489258, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1225.6321907043457, 
+   "completion_ratio": 0.055, 
+   "dup": 0, 
+   "in_buf": 707
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 35, 
+   "delay_mean_ms": 265.27222050702505, 
+   "delay_p99_ms": 942.9659843444824, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 724.6170043945312, 
+   "completion_ratio": 0.04375, 
+   "dup": 0, 
+   "in_buf": 713
+  }, 
+  {
+   "cut_dsn": 100, 
+   "fault_rc": 0, 
+   "fault_detection_window_segments": 30, 
+   "ordered": 35, 
+   "delay_mean_ms": 359.8105110586646, 
+   "delay_p99_ms": 1436.7709159851074, 
+   "fault_type": "sender-egress-kernel-blackhole", 
+   "target_segments": 800, 
+   "fault_iface": "ns-h1/h1-s2", 
+   "delay_p95_ms": 1092.6589965820312, 
+   "completion_ratio": 0.04375, 
+   "dup": 0, 
+   "in_buf": 713
+  }
+ ], 
+ "stage": 0
+}

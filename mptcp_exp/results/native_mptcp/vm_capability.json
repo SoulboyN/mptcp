@@ -1,0 +1,23 @@
+{
+  "kernel": "6.8.0-138-generic",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "protocol": 262,
+  "socket_supported": true,
+  "enabled": "1",
+  "scheduler": "default",
+  "pm_type": "0",
+  "path_manager": null,
+  "ip_version": {
+    "returncode": 0,
+    "output": "ip utility, iproute2-5.15.0, libbpf 0.5.0"
+  },
+  "path_manager_tool": {
+    "returncode": 0,
+    "output": "add_addr_accepted 0 subflows 2"
+  },
+  "tcp_congestion_control": {
+    "returncode": 0,
+    "output": "cubic"
+  },
+  "note": "Capability only. Experiments must additionally verify successful MPTCP negotiation and at least two established kernel subflows."
+}

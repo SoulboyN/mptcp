@@ -67,6 +67,7 @@ class TcpDsnReceiver(object):
         self.dup = 0
         self.per_sub = {}
         self.ordered = []
+        self.delays_ms = []
 
     def _run_control(self):
         """UDP control server: replies to NAK probes with the smallest missing
@@ -106,7 +107,7 @@ class TcpDsnReceiver(object):
             except Exception:
                 pass
 
-    def recv_loop(self, duration):
+    def recv_loop(self, duration, idle_after_close=2.0):
         """Accept subflow connections and read data concurrently, reorder by
         DSN. Keeps reading even if a subflow connects late or never (e.g. a
         path was cut), so the remaining subflows are still delivered. Uses
@@ -116,6 +117,8 @@ class TcpDsnReceiver(object):
         ctl.daemon = True
         ctl.start()
         end = time.time() + duration
+        last_data_at = time.time()
+        accepted_any = False
         self.srv.setblocking(0)
         conns = []              # each entry: [socket, partial-buffer]
         while time.time() < end:
@@ -130,6 +133,7 @@ class TcpDsnReceiver(object):
                         c, _ = s.accept()
                         c.setblocking(0)
                         conns.append([c, b''])
+                        accepted_any = True
                     except socket.error:
                         pass
                     continue
@@ -146,6 +150,7 @@ class TcpDsnReceiver(object):
                     conns.remove(pair)
                     s.close()
                     continue
+                last_data_at = time.time()
                 pair[1] = self._drain(pair[1] + data)
             self._ticks = getattr(self, '_ticks', 0) + 1
             if self._ticks % 100 == 0:
@@ -160,6 +165,9 @@ class TcpDsnReceiver(object):
                 except Exception:
                     pass
             time.sleep(0.01)
+            if (accepted_any and not conns and
+                    time.time() - last_data_at >= idle_after_close):
+                break
         for pair in conns:
             pair[0].close()
         self.srv.close()
@@ -175,6 +183,13 @@ class TcpDsnReceiver(object):
                 break               # header/payload incomplete -> wait for more
             fid, sid, dsn, payload = seg
             self.received += 1
+            if len(payload) >= 10 and payload[:2] == b'TS':
+                try:
+                    sent_at = struct.unpack('!d', payload[2:10])[0]
+                    delay_ms = max(0.0, (time.time() - sent_at) * 1000.0)
+                    self.delays_ms.append(delay_ms)
+                except Exception:
+                    pass
             if dsn in self.seen:
                 self.dup += 1          # retransmission arrived after delivery
             else:
@@ -191,12 +206,21 @@ class TcpDsnReceiver(object):
         return buf[off:]
 
     def stats(self):
+        delays = sorted(self.delays_ms)
+        def _pct(p):
+            if not delays:
+                return 0.0
+            idx = int(round((len(delays) - 1) * p))
+            return delays[max(0, min(len(delays) - 1, idx))]
         return {'received': self.received,
                 'ordered': len(self.ordered),
                 'next_dsn': self.next_dsn,
                 'dup': self.dup,
                 'per_sub': self.per_sub,
-                'in_buf': len(self.buf)}
+                'in_buf': len(self.buf),
+                'delay_mean_ms': (sum(delays) / len(delays)) if delays else 0.0,
+                'delay_p95_ms': _pct(0.95),
+                'delay_p99_ms': _pct(0.99)}
 
 
 class TcpSsnSender(object):
@@ -260,8 +284,9 @@ class MptcpGroupSender(object):
 
     REPLAY_WIN = 20              # DSNs to replay per dead subflow
     NAK_BATCH = 500              # DSNs to retransmit per NAK round
-    NAK_POLL = 0.7               # seconds between NAK polls
+    NAK_POLL = 0.3               # seconds between NAK/SACK polls
     NAK_PACE = 0.003             # seconds between retransmitted DSNs
+    PAYLOAD_BYTES = 1200         # meaningful link load; below Ethernet MTU
 
     # RTT per path (matches run_mptcp.py's tc netem: sw1 WiFi 10ms, sw2 cell
     # 30ms, sw3 fiber 2ms, direct unshaped). Used by LIA/OLIA coupled CC.
@@ -276,7 +301,7 @@ class MptcpGroupSender(object):
         self.flow_id = flow_id
         self.port = port
         self.control_port = control_port or port
-        self.cc_mode = cc_mode              # 'rl' | 'fixed' | 'lia' | 'olia' | 'aimd'
+        self.cc_mode = cc_mode              # 'rl' | 'local' | 'fixed' | 'lia' | 'olia' | 'aimd'
         self.fixed_cwnd = fixed_cwnd
         self.credit_limit = credit_limit    # receiver-granted in-flight cap
         self.pace = pace                    # run_loop poll when window full (s)
@@ -318,6 +343,10 @@ class MptcpGroupSender(object):
                 self.senders.append(s)
         import mptcp_scheduler as sch
         self.scheduler = sch.RlScheduler(self.senders, policy_path=policy_path)
+        if self.cc_mode == 'local':
+            # Local ECN/Credit baseline without a learned residual. This is
+            # the causal control needed to isolate the Q-table contribution.
+            self.scheduler.policy_residual = [2, 2, 2, 2, 2]
         ctl = threading.Thread(target=self._nak_loop)
         ctl.daemon = True
         ctl.start()
@@ -334,7 +363,10 @@ class MptcpGroupSender(object):
             return None
 
     def _payload(self, dsn):
-        return b'I%03d' % dsn
+        # All namespaces share the host clock, so this embedded timestamp
+        # yields end-to-end application delivery latency for every segment.
+        head = b'TS' + struct.pack('!d', time.time()) + (b'I%03d' % dsn)
+        return head + (b'Q' * max(0, self.PAYLOAD_BYTES - len(head)))
 
     def _send_on(self, s, dsn):
         s.send_seg(self.flow_id, dsn, payload=self._payload(dsn))
@@ -356,6 +388,10 @@ class MptcpGroupSender(object):
         ctl.settimeout(1.5)
         self._last_rcv = {}         # sid -> received count at previous poll
         self._stall_rounds = {}     # sid -> consecutive non-advancing rounds
+        nak_prev_nxt = None
+        nak_prev_maxd = None
+        nak_prev_total = None
+        nak_stable = 0
         while True:
             time.sleep(self.NAK_POLL)
             with self._lock:
@@ -406,8 +442,22 @@ class MptcpGroupSender(object):
                 self._check_stalls(rcv)
                 with self._lock:
                     self._recv_epoch += 1
-                if self.stages.get('nak', 1) and nxt < maxd:
+                # Reordering across 1/10/30-ms paths temporarily looks like a
+                # loss.  Require the same gap and send watermark to persist
+                # for three polls before retransmitting; otherwise normal
+                # in-flight packets are duplicated by an eager NAK.
+                rcv_total = sum(rcv.values())
+                if (nxt == nak_prev_nxt and maxd == nak_prev_maxd and
+                        rcv_total == nak_prev_total):
+                    nak_stable += 1
+                else:
+                    nak_stable = 0
+                nak_prev_nxt, nak_prev_maxd, nak_prev_total = (
+                    nxt, maxd, rcv_total)
+                if (self.stages.get('nak', 1) and nxt < maxd and
+                        nak_stable >= 6):
                     self._retransmit_range(nxt, maxd)
+                    nak_stable = 0
                 break
 
     def _diag_loop(self):
@@ -476,11 +526,10 @@ class MptcpGroupSender(object):
                 if self._retransmit(start + i):
                     n += 1
                 time.sleep(self.NAK_PACE)
-        limit = min(end, start + self.NAK_BATCH)
-        for dsn in range(start + 128, limit):
-            if self._retransmit(dsn):
-                n += 1
-            time.sleep(self.NAK_PACE)
+        # Do not blindly retransmit beyond the receiver's 128-bit SACK
+        # horizon.  Those DSNs are unknown, not missing; treating them as
+        # losses caused hundreds of avoidable duplicates.  Once the current
+        # holes are filled, the next poll advances the horizon naturally.
         if n:
             print '  [sender] NAK: recovered %d missing DSN(s) from %d on healthy subflows' % (
                 n, start)
@@ -563,7 +612,7 @@ class MptcpGroupSender(object):
         self._try_reconnect()
         now = time.time()
         self._rl_counter += 1
-        if self.cc_mode == 'rl':
+        if self.cc_mode in ('rl', 'local'):
             # time-based: RL reads the global ECN view, refreshed independently
             if now - self._last_cc_t >= self.cc_period:
                 self._last_cc_t = now
@@ -737,7 +786,9 @@ class MptcpGroupSender(object):
         self._dbg('  [cc] aimd cwnd=%s' % {s.sid_int: s.cwnd for s in live})
         return 2 if congested else (1 if any(s.cwnd > 20 for s in live) else 0)
 
-    def run_loop(self, stop_file=None, settle=3.0, cmd_file=None):
+    def run_loop(self, stop_file=None, settle=3.0, cmd_file=None,
+                 max_segments=None, progress_file=None, pause_at=None,
+                 resume_file=None):
         """Main send loop with graceful shutdown: keep sending until stop_file
         appears (or KeyboardInterrupt); then stop assigning new DSNs, let the
         NAK thread + active tail recovery fill the remaining gap, and close
@@ -750,15 +801,45 @@ class MptcpGroupSender(object):
         is full); when all windows are full we poll at self.pace so the send
         rate is governed by in_flight < min(cwnd, credit), not a fixed timer."""
         dsn = 0
+        paused_once = False
         _t0 = time.time()
+        if cmd_file:
+            cmd_thr = threading.Thread(target=self._command_loop,
+                                       args=(cmd_file,))
+            cmd_thr.daemon = True
+            cmd_thr.start()
         try:
             while True:
                 if stop_file and os.path.exists(stop_file):
                     break
+                if max_segments is not None and dsn >= max_segments:
+                    break
+                # Deterministic experiment barrier.  The controller can pause
+                # assignment at an exact DSN, inject a physical link fault,
+                # wait until the sender has closed the failed socket, and only
+                # then release the workload.  This prevents a short workload
+                # from being queued entirely in the kernel before the fault.
+                if (pause_at is not None and not paused_once and
+                        dsn >= pause_at and resume_file):
+                    paused_once = True
+                    if progress_file:
+                        try:
+                            with open(progress_file, 'w') as _f:
+                                _f.write(str(dsn))
+                        except Exception:
+                            pass
+                    while not os.path.exists(resume_file):
+                        time.sleep(0.01)
+                    # A fault-detection-window command may have assigned DSNs
+                    # directly to the now-black-holed subflow while this main
+                    # loop was paused.  Continue after that reserved range.
+                    with self._lock:
+                        dsn = max(dsn, self.max_dsn)
                 # ablation: kill a subflow at a fixed time to simulate a path
                 # drop (its in-flight window is recovered only if the replay/
                 # nak/tail layers are enabled for this stage)
-                if (self.auto_drop_sid is not None and not self._dropped_auto
+                if (self.auto_drop_sid is not None and self.auto_drop_at is not None
+                        and not self._dropped_auto
                         and time.time() - _t0 >= self.auto_drop_at):
                     self._dropped_auto = True
                     with self._lock:
@@ -779,31 +860,40 @@ class MptcpGroupSender(object):
                         print '  [abl] dropped subflow %d (t=%.1fs, assigned=%d)' % (
                             self.auto_drop_sid, time.time() - _t0,
                             len(getattr(tgt, 'assigned', [])))
-                if cmd_file and os.path.exists(cmd_file):
-                    try:
-                        with open(cmd_file) as _f:
-                            lines = _f.read().strip().splitlines()
-                        os.remove(cmd_file)
-                        for line in lines:
-                            self._exec_cmd(line)
-                    except Exception:
-                        pass
                 if self.send_next(dsn):
                     dsn += 1
+                    if progress_file and dsn % 10 == 0:
+                        try:
+                            with open(progress_file, 'w') as _f:
+                                _f.write(str(dsn))
+                        except Exception:
+                            pass
                 else:
                     time.sleep(self.pace)
         except KeyboardInterrupt:
             pass
-        if stop_file and self.stages.get('tail', 1):
-            deadline = time.time() + settle
-            while time.time() < deadline:
-                with self._lock:
-                    nxt = self._recv_next
-                    maxd = self.max_dsn
-                if nxt >= maxd:
-                    break                      # tail fully recovered
-                self._retransmit_remaining()
-                time.sleep(0.3)
+        if stop_file or max_segments is not None:
+            if self.stages.get('tail', 1):
+                deadline = time.time() + settle
+                while time.time() < deadline:
+                    with self._lock:
+                        nxt = self._recv_next
+                        maxd = self.max_dsn
+                    if nxt >= maxd:
+                        break                  # tail fully recovered
+                    self._retransmit_remaining()
+                    time.sleep(0.3)
+            elif self.stages.get('nak', 1):
+                # NAK-only ablation: keep healthy sockets open long enough for
+                # the background SACK loop to repair a persistent gap.  This
+                # is passive convergence; the full stage below additionally
+                # performs active tail recovery.
+                deadline = time.time() + settle
+                while time.time() < deadline:
+                    with self._lock:
+                        if self._recv_next >= self.max_dsn:
+                            break
+                    time.sleep(0.1)
         for s in list(self.senders):
             try:
                 s.close()
@@ -812,9 +902,24 @@ class MptcpGroupSender(object):
         print '  [sender] gracefully closed after %d DSNs (recv next=%d)' % (
             dsn, self._recv_next)
 
+    def _command_loop(self, cmd_file):
+        """Process SDN control commands even if the send thread is blocked."""
+        while True:
+            if os.path.exists(cmd_file):
+                try:
+                    with open(cmd_file) as _f:
+                        lines = _f.read().strip().splitlines()
+                    os.remove(cmd_file)
+                    for line in lines:
+                        self._exec_cmd(line)
+                    with open(cmd_file + '.ack', 'w') as _f:
+                        _f.write('ok')
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
     def _exec_cmd(self, line):
-        """Execute one control command: 'add <sid> <dst_ip> <path>' or
-        'remove <sid>' -- dynamic subflow management (ADD_ADDR/REMOVE_ADDR)."""
+        """Execute ADD/REMOVE or a controller-confirmed path failure."""
         parts = line.split()
         if not parts:
             return
@@ -822,6 +927,46 @@ class MptcpGroupSender(object):
             self.add_subflow(parts[2], int(parts[1]), parts[3])
         elif parts[0] == 'remove' and len(parts) >= 2:
             self.remove_subflow(int(parts[1]))
+        elif parts[0] == 'fail' and len(parts) >= 2:
+            sid = int(parts[1])
+            with self._lock:
+                s = next((x for x in self.senders if x.sid_int == sid), None)
+            if s is not None:
+                assigned = len(s.assigned)
+                # Abort rather than gracefully close: a normal close keeps
+                # unacknowledged TCP data in the kernel and may retransmit it
+                # after the experiment restores the path, masking the fault.
+                try:
+                    import struct as _st
+                    s.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                      _st.pack('ii', 1, 0))
+                except Exception:
+                    pass
+                self._drop(s)
+                print '  [abl] controller confirmed failed subflow %d (assigned=%d)' % (
+                    sid, assigned)
+        elif parts[0] == 'faultburst' and len(parts) >= 3:
+            # Model a bounded controller/path-failure detection delay.  The
+            # kernel qdisc is already a 100% black hole, but the sender has not
+            # yet learned that fact, so these new DSNs are accepted by TCP and
+            # then lost.  This makes the ablation independent of host timing.
+            sid, count = int(parts[1]), int(parts[2])
+            with self._lock:
+                s = next((x for x in self.senders if x.sid_int == sid), None)
+            sent = 0
+            while s is not None and sent < count:
+                with self._lock:
+                    dsn = self.max_dsn
+                    self.max_dsn += 1
+                try:
+                    self._send_on(s, dsn)
+                    s.send_count += 1
+                    s.assigned.append(dsn)
+                    sent += 1
+                except Exception:
+                    break
+            print '  [abl] fault-detection window assigned %d DSN(s) to subflow %d' % (
+                sent, sid)
 
     def add_subflow(self, dst_ip, sid, path):
         """Dynamically add a subflow (MPTCP ADD_ADDR simulation). Returns the
